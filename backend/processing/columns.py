@@ -214,3 +214,54 @@ TEAM_WEEKLY_STAT_COLUMNS = [
     "receiving_epa",
     "receiving_2pt_conversions",
 ]
+
+# Raw nflverse depth-chart schema used through the 2024 season.
+LEGACY_DEPTH_CHART_COLUMNS = [
+    "season",
+    "club_code",
+    "week",
+    "game_type",
+    "depth_team",
+    "football_name",
+    "formation",
+    "gsis_id",
+    "jersey_number",
+    "position",
+    "depth_position",
+    "full_name",
+]
+
+# Raw nflverse timestamped depth-chart schema used from the 2025 season onward.
+TIMESTAMPED_DEPTH_CHART_COLUMNS = [
+    "dt",
+    "team",
+    "player_name",
+    "espn_id",
+    "gsis_id",
+    "pos_grp_id",
+    "pos_grp",
+    "pos_id",
+    "pos_name",
+    "pos_abb",
+    "pos_slot",
+    "pos_rank",
+]
+
+# Source-independent schema written to processed depth-chart tables.
+NORMALIZED_DEPTH_CHART_COLUMNS = [
+    "season",
+    "week",
+    "season_type",
+    "snapshot_at",
+    "team",
+    "player_name",
+    "gsis_id",
+    "espn_id",
+    "formation",
+    "position_group",
+    "position_name",
+    "position",
+    "position_slot",
+    "depth_rank",
+    "jersey_number",
+]

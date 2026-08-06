@@ -1,21 +1,8 @@
-"""Small model-facing query tools backed by processed Parquet files. Temporary for testing locally."""
+"""Model-facing NFL tools backed by the selected data repository."""
 
-from pathlib import Path
-
-import polars as pl
+from repositories import nfl_supabase as repository
 
 
-PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
-
-BASE_STAT_FIELDS = [
-    "player_id",
-    "season",
-    "week",
-    "season_type",
-    "game_id",
-    "team",
-    "opponent_team",
-]
 ALLOWED_STAT_FIELDS = {
     "completions",
     "attempts",
@@ -54,27 +41,10 @@ def _stat_fields(fields: list[str] | None) -> list[str]:
 
 def find_players(name: str) -> list[dict]:
     """Find players by a case-insensitive partial name."""
-    query = name.strip().lower()
+    query = name.strip()
     if not query:
         raise ValueError("name cannot be empty")
-
-    players = pl.scan_parquet(PROCESSED_DIR / "reference" / "players.parquet")
-    status = pl.scan_parquet(PROCESSED_DIR / "current" / "player_status.parquet")
-
-    return (
-        players.join(status.select("player_id", "latest_team", "status"), on="player_id")
-        .filter(pl.col("display_name").str.to_lowercase().str.contains(query, literal=True))
-        .select(
-            "player_id",
-            "display_name",
-            "position",
-            "latest_team",
-            "status",
-        )
-        .limit(10)
-        .collect()
-        .to_dicts()
-    )
+    return repository.find_players(query)
 
 
 def get_player_weekly_stats(
@@ -84,14 +54,9 @@ def get_player_weekly_stats(
     fields: list[str] | None = None,
 ) -> list[dict]:
     """Return one player's weekly stats, optionally for one week."""
-    selected = _stat_fields(fields)
-    stats = pl.scan_parquet(
-        PROCESSED_DIR / "seasons" / str(season) / "player_weekly_stats.parquet"
-    ).filter(pl.col("player_id") == player_id)
-    if week is not None:
-        stats = stats.filter(pl.col("week") == week)
-
-    return stats.select(*BASE_STAT_FIELDS, *selected).sort("week").collect().to_dicts()
+    return repository.get_player_weekly_stats(
+        player_id, season, week, _stat_fields(fields)
+    )
 
 
 def get_player_season_totals(
@@ -100,46 +65,17 @@ def get_player_season_totals(
     fields: list[str] | None = None,
 ) -> dict:
     """Sum additive player statistics across a season."""
-    selected = _stat_fields(fields)
-    stats = pl.scan_parquet(
-        PROCESSED_DIR / "seasons" / str(season) / "player_weekly_stats.parquet"
-    ).filter(pl.col("player_id") == player_id)
-
-    result = stats.select(
-        pl.len().alias("games"),
-        *[pl.col(field).sum().alias(field) for field in selected],
-    ).collect().to_dicts()[0]
-    return {"player_id": player_id, "season": season, **result}
+    return repository.get_player_season_totals(
+        player_id, season, _stat_fields(fields)
+    )
 
 
 def get_team_games(team: str, season: int, week: int | None = None) -> list[dict]:
     """Return recent schedule/results data for a team."""
-    games = pl.scan_parquet(
-        PROCESSED_DIR / "seasons" / str(season) / "games.parquet"
-    ).filter((pl.col("home_team") == team.upper()) | (pl.col("away_team") == team.upper()))
-    if week is not None:
-        games = games.filter(pl.col("week") == week)
-
-    return (
-        games.select(
-            "game_id",
-            "season",
-            "game_type",
-            "week",
-            "gameday",
-            "away_team",
-            "away_score",
-            "home_team",
-            "home_score",
-            "overtime",
-            "spread_line",
-            "total_line",
-        )
-        .sort("gameday")
-        .collect()
-        .with_columns(pl.col("gameday").cast(pl.String))
-        .to_dicts()
-    )
+    team_code = team.strip().upper()
+    if not team_code.isalpha() or not 2 <= len(team_code) <= 3:
+        raise ValueError("team must be a two- or three-letter NFL abbreviation")
+    return repository.get_team_games(team_code, season, week)
 
 
 TOOL_HANDLERS = {
