@@ -15,6 +15,7 @@ from .common import (
     validate_unique,
     write_outputs,
 )
+from ..fantasy.identity import build_fantasy_external_ids
 
 
 def process_reference() -> None:
@@ -29,7 +30,7 @@ def process_reference() -> None:
         .with_columns(pl.col("birth_date").str.to_date(strict=False))
         .select("player_id", *PLAYER_COLUMNS)
     )
-    external_ids = (
+    nfl_external_ids = (
         raw_players.select(EXTERNAL_ID_COLUMNS)
         .join(identities.select("gsis_id", "player_id"), on="gsis_id")
         .unpivot(
@@ -44,6 +45,15 @@ def process_reference() -> None:
         )
         .with_columns(pl.col("provider").str.replace(r"_id$", ""))
         .unique(subset=["provider", "external_id"])
+        .sort("player_id", "provider")
+    )
+    fantasy_external_ids, unmatched_fantasy_ids = build_fantasy_external_ids(
+        identities,
+        reference_season=int(raw_dir.name),
+    )
+    external_ids = (
+        pl.concat([nfl_external_ids, fantasy_external_ids], how="vertical_relaxed")
+        .unique(subset=["provider", "external_id"], maintain_order=True)
         .sort("player_id", "provider")
     )
     teams = raw_teams.select(TEAM_COLUMNS)
@@ -62,6 +72,7 @@ def process_reference() -> None:
             "teams": teams,
         },
         workflow="reference",
+        dropped={"fantasy_player_ids": unmatched_fantasy_ids},
     )
     # This is the latest status embedded in the reference player snapshot.
     # The current workflow may replace it with fresher weekly-roster status.

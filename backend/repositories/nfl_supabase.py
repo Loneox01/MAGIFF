@@ -89,6 +89,22 @@ ROSTER_FIELDS = [
     "status_description_abbr",
     "years_exp",
 ]
+ECR_FIELDS = [
+    "player_id",
+    "season",
+    "scrape_date",
+    "scoring_format",
+    "league_format",
+    "snapshot_type",
+    "overall_rank",
+    "best_rank",
+    "worst_rank",
+    "rank_sd",
+    "rank_delta",
+    "position",
+    "team",
+    "source",
+]
 
 
 def find_players(name: str) -> list[dict]:
@@ -339,6 +355,76 @@ def get_player_season_candidates(
     return rows
 
 
+def get_player_weekly_analysis_inputs(
+    season: int,
+    season_type: str,
+    position: str | None,
+    player_ids: list[str] | None,
+    fields: list[str],
+    include_rosters: bool,
+) -> tuple[list[dict], list[dict]]:
+    """Fetch paginated weekly stats and optional roster participation rows."""
+    client = get_supabase_client()
+
+    def fetch_pages(query, order_fields: list[str]) -> list[dict]:
+        rows: list[dict] = []
+        page_size = 1000
+        start = 0
+        while True:
+            ordered = query
+            for field in order_fields:
+                ordered = ordered.order(field)
+            page = (
+                ordered.range(start, start + page_size - 1).execute().data
+            )
+            rows.extend(page)
+            if len(page) < page_size:
+                return rows
+            start += page_size
+
+    weekly_columns = list(
+        dict.fromkeys(
+            [
+                "player_id",
+                "week",
+                "team",
+                "position",
+                *fields,
+            ]
+        )
+    )
+    weekly_query = (
+        client.table("player_weekly_stats")
+        .select(",".join(weekly_columns))
+        .eq("season", season)
+        .eq("season_type", season_type)
+    )
+    if position is not None:
+        weekly_query = weekly_query.eq("position", position)
+    if player_ids is not None:
+        weekly_query = weekly_query.in_("player_id", player_ids)
+    weekly_rows = fetch_pages(weekly_query, ["player_id", "week"])
+
+    if not include_rosters:
+        return weekly_rows, []
+
+    roster_query = (
+        client.table("player_weekly_rosters")
+        .select("player_id,week,team,position,status")
+        .eq("season", season)
+    )
+    if season_type == "REG":
+        roster_query = roster_query.eq("game_type", "REG")
+    else:
+        roster_query = roster_query.in_("game_type", ["WC", "DIV", "CON", "SB"])
+    if position is not None:
+        roster_query = roster_query.eq("position", position)
+    if player_ids is not None:
+        roster_query = roster_query.in_("player_id", player_ids)
+    roster_rows = fetch_pages(roster_query, ["player_id", "week"])
+    return weekly_rows, roster_rows
+
+
 def get_player_names(player_ids: list[str]) -> dict[str, str]:
     """Resolve the small final ranking result to display names."""
     if not player_ids:
@@ -352,6 +438,72 @@ def get_player_names(player_ids: list[str]) -> dict[str, str]:
         .data
     )
     return {row["player_id"]: row["display_name"] for row in rows}
+
+
+def get_ecr_rows(
+    season: int,
+    scoring_format: str,
+    league_format: str,
+    snapshot_type: str,
+    as_of_date: str | None,
+) -> tuple[str | None, list[dict]]:
+    """Fetch the latest qualifying ECR snapshot and all its player rows."""
+    client = get_supabase_client()
+    date_query = (
+        client.table("player_ecr")
+        .select("scrape_date")
+        .eq("season", season)
+        .eq("scoring_format", scoring_format)
+        .eq("league_format", league_format)
+        .eq("snapshot_type", snapshot_type)
+    )
+    if as_of_date is not None:
+        date_query = date_query.lte("scrape_date", as_of_date)
+    dates = date_query.order("scrape_date", desc=True).limit(1).execute().data
+    if not dates:
+        return None, []
+
+    selected_date = dates[0]["scrape_date"]
+    rows = (
+        client.table("player_ecr")
+        .select(",".join(ECR_FIELDS))
+        .eq("season", season)
+        .eq("scoring_format", scoring_format)
+        .eq("league_format", league_format)
+        .eq("snapshot_type", snapshot_type)
+        .eq("scrape_date", selected_date)
+        .order("overall_rank")
+        .limit(1000)
+        .execute()
+        .data
+    )
+    return selected_date, rows
+
+
+def get_season_fantasy_results(season: int) -> list[dict]:
+    """Fetch regular-season scoring inputs used for ECR comparisons."""
+    client = get_supabase_client()
+    rows: list[dict] = []
+    page_size = 1000
+    start = 0
+    while True:
+        page = (
+            client.table("player_season_stats")
+            .select(
+                "player_id,season,games,last_team,position,receptions,"
+                "fantasy_points,fantasy_points_ppr"
+            )
+            .eq("season", season)
+            .eq("season_type", "REG")
+            .order("player_id")
+            .range(start, start + page_size - 1)
+            .execute()
+            .data
+        )
+        rows.extend(page)
+        if len(page) < page_size:
+            return rows
+        start += page_size
 
 
 def get_team_formula_inputs(

@@ -11,6 +11,7 @@ processed/
 │   └── teams.parquet
 ├── current/
 │   ├── player_status.parquet
+│   ├── player_ecr.parquet
 │   ├── games.parquet
 │   └── depth_chart_entries.parquet
 └── seasons/
@@ -21,6 +22,7 @@ processed/
     │   ├── player_weekly_rosters.parquet
     │   ├── player_snap_counts.parquet
     │   ├── team_weekly_stats.parquet
+    │   ├── player_ecr.parquet
     │   └── depth_chart_entries.parquet
     └── 2025/
         ├── games.parquet
@@ -29,6 +31,7 @@ processed/
         ├── player_weekly_rosters.parquet
         ├── player_snap_counts.parquet
         ├── team_weekly_stats.parquet
+        ├── player_ecr.parquet
         └── depth_chart_entries.parquet
 ```
 

@@ -17,6 +17,31 @@ python -m backend.processing.workflows.historical --season 2024
 python -m backend.processing.workflows.historical --season 2025
 ```
 
+Fantasy-market processing uses the same internal player UUIDs while keeping
+time-dependent ECR separate from player identity data:
+
+```bash
+python -m backend.processing.workflows.reference
+python -m backend.processing.fantasy.ecr current --season 2026
+python -m backend.processing.fantasy.ecr historical --season 2024 --reference-season 2026
+python -m backend.processing.fantasy.ecr historical --season 2025 --reference-season 2026
+```
+
+The reference workflow adds selected FantasyPros, Sleeper, ESPN, Yahoo, CBS,
+MFL, and PFR mappings to `player_external_ids.parquet`. Current ECR is written
+to `current/player_ecr.parquet`; completed-season snapshots are written to
+`seasons/{season}/player_ecr.parquet`. PPR redraft pages are labeled directly;
+formats whose source page does not state a scoring system use
+`scoring_format=source_default` rather than an unsupported assumption.
+
+The Supabase loader can upload ECR without re-uploading the larger NFL tables:
+
+```bash
+python -m backend.database.load_supabase --workflow fantasy-current --season 2026
+python -m backend.database.load_supabase --workflow fantasy-historical --season 2024
+python -m backend.database.load_supabase --workflow fantasy-reference
+```
+
 Depth-chart source formats are isolated in
 `normalization/depth_charts.py`. Add another adapter there if nflverse changes
 its schema for an older or future season.

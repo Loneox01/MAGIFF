@@ -7,6 +7,9 @@ Examples:
     python -m backend.database.load_supabase --workflow reference
     python -m backend.database.load_supabase --workflow current --season 2026
     python -m backend.database.load_supabase --workflow historical --season 2025
+    python -m backend.database.load_supabase --workflow fantasy-current --season 2026
+    python -m backend.database.load_supabase --workflow fantasy-historical --season 2025
+    python -m backend.database.load_supabase --workflow fantasy-reference
 """
 
 import argparse
@@ -27,7 +30,15 @@ PROCESSED_DIR = BACKEND_DIR / "data" / "processed"
 SEASONS_DIR = PROCESSED_DIR / "seasons"
 
 LoadMode = Literal["upsert", "replace_season"]
-Workflow = Literal["all", "reference", "current", "historical"]
+Workflow = Literal[
+    "all",
+    "reference",
+    "current",
+    "historical",
+    "fantasy-reference",
+    "fantasy-current",
+    "fantasy-historical",
+]
 
 
 @dataclass(frozen=True)
@@ -37,6 +48,7 @@ class LoadSpec:
     conflict_columns: str | None
     mode: LoadMode = "upsert"
     season: int | None = None
+    provider_filter: tuple[str, ...] | None = None
 
 
 def processed_seasons() -> list[int]:
@@ -124,6 +136,15 @@ def historical_specs(season: int) -> list[LoadSpec]:
                 season=season,
             )
         )
+    add_if_present(
+        specs,
+        LoadSpec(
+            "player_ecr",
+            directory / "player_ecr.parquet",
+            "player_id,season,scrape_date,scoring_format,league_format",
+            season=season,
+        ),
+    )
     return specs
 
 
@@ -146,12 +167,77 @@ def current_specs(season: int) -> list[LoadSpec]:
             season=season,
         ),
     )
+    add_if_present(
+        specs,
+        LoadSpec(
+            "player_ecr",
+            directory / "player_ecr.parquet",
+            "player_id,season,scrape_date,scoring_format,league_format",
+            season=season,
+        ),
+    )
     return specs
+
+
+def fantasy_current_specs(season: int) -> list[LoadSpec]:
+    path = PROCESSED_DIR / "current" / "player_ecr.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Processed current ECR not found: {path}")
+    return [
+        LoadSpec(
+            "player_ecr",
+            path,
+            "player_id,season,scrape_date,scoring_format,league_format",
+            season=season,
+        )
+    ]
+
+
+def fantasy_reference_specs() -> list[LoadSpec]:
+    """Upload only provider mappings introduced by fantasy processing."""
+    path = PROCESSED_DIR / "reference" / "player_external_ids.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Processed external IDs not found: {path}")
+    return [
+        LoadSpec(
+            "player_external_ids",
+            path,
+            "provider,external_id",
+            provider_filter=(
+                "fantasypros",
+                "sleeper",
+                "espn",
+                "yahoo",
+                "cbs",
+                "mfl",
+                "pfr",
+            ),
+        )
+    ]
+
+
+def fantasy_historical_specs(season: int) -> list[LoadSpec]:
+    path = SEASONS_DIR / str(season) / "player_ecr.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Processed historical ECR not found: {path}")
+    return [
+        LoadSpec(
+            "player_ecr",
+            path,
+            "player_id,season,scrape_date,scoring_format,league_format",
+            season=season,
+        )
+    ]
 
 
 def build_load_plan(workflow: Workflow, season: int | None) -> list[LoadSpec]:
     """Build the requested frequency-aware, dependency-ordered upload plan."""
-    if workflow in {"current", "historical"} and season is None:
+    if workflow in {
+        "current",
+        "historical",
+        "fantasy-current",
+        "fantasy-historical",
+    } and season is None:
         raise ValueError(f"--season is required for the {workflow} workflow")
 
     if workflow == "reference":
@@ -160,6 +246,12 @@ def build_load_plan(workflow: Workflow, season: int | None) -> list[LoadSpec]:
         return current_specs(season)  # type: ignore[arg-type]
     if workflow == "historical":
         return historical_specs(season)  # type: ignore[arg-type]
+    if workflow == "fantasy-reference":
+        return fantasy_reference_specs()
+    if workflow == "fantasy-current":
+        return fantasy_current_specs(season)  # type: ignore[arg-type]
+    if workflow == "fantasy-historical":
+        return fantasy_historical_specs(season)  # type: ignore[arg-type]
 
     specs = reference_specs()
     for historical_season in processed_seasons():
@@ -187,9 +279,16 @@ def batches(rows: list[dict], size: int) -> Iterator[list[dict]]:
         yield rows[start : start + size]
 
 
-def read_json_rows(path: Path) -> list[dict]:
+def read_json_rows(
+    path: Path,
+    provider_filter: tuple[str, ...] | None = None,
+) -> list[dict]:
     """Read Parquet and convert values into JSON-compatible objects."""
     frame = pl.read_parquet(path)
+    if provider_filter is not None:
+        if "provider" not in frame.columns:
+            raise ValueError(f"Provider filter requested for {path} without provider column")
+        frame = frame.filter(pl.col("provider").is_in(provider_filter))
     conversions = []
 
     for column, dtype in frame.schema.items():
@@ -266,7 +365,7 @@ def load_data(
     for spec in plan:
         if not spec.path.exists():
             raise FileNotFoundError(f"Processed file not found: {spec.path}")
-        rows = read_json_rows(spec.path)
+        rows = read_json_rows(spec.path, spec.provider_filter)
         row_seasons = {
             row["season"] for row in rows
             if "season" in row and row["season"] is not None
@@ -310,14 +409,22 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument(
         "--workflow",
-        choices=("all", "reference", "current", "historical"),
+        choices=(
+            "all",
+            "reference",
+            "current",
+            "historical",
+            "fantasy-reference",
+            "fantasy-current",
+            "fantasy-historical",
+        ),
         default="all",
         help="Upload only data belonging to this refresh frequency.",
     )
     parser.add_argument(
         "--season",
         type=int,
-        help="Required for current and historical workflows.",
+        help="Required for current and historical workflows, including fantasy.",
     )
     parser.add_argument(
         "--dry-run",
