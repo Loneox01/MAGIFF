@@ -215,6 +215,62 @@ TEAM_WEEKLY_STAT_COLUMNS = [
     "receiving_2pt_conversions",
 ]
 
+# Numeric outputs produced by player_season_stats.py. Keeping these beside the
+# processed schemas lets ingestion, processing, and model-facing tools share one
+# field contract.
+PLAYER_SEASON_ADDITIVE_COLUMNS = [
+    "completions",
+    "attempts",
+    "passing_yards",
+    "passing_tds",
+    "passing_interceptions",
+    "sacks_suffered",
+    "sack_yards_lost",
+    "passing_air_yards",
+    "passing_yards_after_catch",
+    "passing_first_downs",
+    "passing_2pt_conversions",
+    "carries",
+    "rushing_yards",
+    "rushing_tds",
+    "rushing_fumbles",
+    "rushing_fumbles_lost",
+    "rushing_first_downs",
+    "rushing_2pt_conversions",
+    "receptions",
+    "targets",
+    "receiving_yards",
+    "receiving_tds",
+    "receiving_fumbles",
+    "receiving_fumbles_lost",
+    "receiving_air_yards",
+    "receiving_yards_after_catch",
+    "receiving_first_downs",
+    "receiving_2pt_conversions",
+    "fantasy_points",
+    "fantasy_points_ppr",
+]
+
+PLAYER_SEASON_DERIVED_COLUMNS = [
+    "passing_epa",
+    "rushing_epa",
+    "receiving_epa",
+    "completion_percentage",
+    "passing_yards_per_attempt",
+    "passing_epa_per_attempt",
+    "passing_cpoe",
+    "pacr",
+    "rushing_yards_per_carry",
+    "rushing_epa_per_carry",
+    "catch_percentage",
+    "receiving_yards_per_reception",
+    "receiving_yards_per_target",
+    "receiving_epa_per_target",
+    "racr",
+    "fantasy_points_per_game",
+    "fantasy_points_ppr_per_game",
+]
+
 # Raw nflverse depth-chart schema used through the 2024 season.
 LEGACY_DEPTH_CHART_COLUMNS = [
     "season",

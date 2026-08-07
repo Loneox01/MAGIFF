@@ -11,44 +11,12 @@ from pathlib import Path
 
 import polars as pl
 
+from processing.columns import PLAYER_SEASON_ADDITIVE_COLUMNS
+
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 PROCESSED_DIR = BACKEND_DIR / "data" / "processed"
 DEFAULT_SEASON = 2025
-
-ADDITIVE_COLUMNS = [
-    "completions",
-    "attempts",
-    "passing_yards",
-    "passing_tds",
-    "passing_interceptions",
-    "sacks_suffered",
-    "sack_yards_lost",
-    "passing_air_yards",
-    "passing_yards_after_catch",
-    "passing_first_downs",
-    "passing_2pt_conversions",
-    "carries",
-    "rushing_yards",
-    "rushing_tds",
-    "rushing_fumbles",
-    "rushing_fumbles_lost",
-    "rushing_first_downs",
-    "rushing_2pt_conversions",
-    "receptions",
-    "targets",
-    "receiving_yards",
-    "receiving_tds",
-    "receiving_fumbles",
-    "receiving_fumbles_lost",
-    "receiving_air_yards",
-    "receiving_yards_after_catch",
-    "receiving_first_downs",
-    "receiving_2pt_conversions",
-    "fantasy_points",
-    "fantasy_points_ppr",
-]
-
 
 def ratio(numerator: str, denominator: str, alias: str, scale: float = 1.0) -> pl.Expr:
     """Return a null-safe ratio calculated from season totals."""
@@ -72,7 +40,10 @@ def build_player_season_stats(weekly_stats: pl.DataFrame) -> pl.DataFrame:
             pl.col("team").last().alias("last_team"),
             pl.col("position").last(),
             pl.col("position_group").last(),
-            *[pl.col(column).sum().alias(column) for column in ADDITIVE_COLUMNS],
+            *[
+                pl.col(column).sum().alias(column)
+                for column in PLAYER_SEASON_ADDITIVE_COLUMNS
+            ],
             pl.col("passing_epa").sum().alias("passing_epa"),
             (pl.col("passing_cpoe") * pl.col("attempts"))
             .sum()
