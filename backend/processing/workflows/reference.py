@@ -16,6 +16,7 @@ from .common import (
     write_outputs,
 )
 from ..fantasy.identity import build_fantasy_external_ids
+from ..normalization.team_codes import normalize_team_codes
 
 
 def process_reference() -> None:
@@ -24,7 +25,7 @@ def process_reference() -> None:
     raw_teams = pl.read_parquet(raw_dir / "teams.parquet")
     identities = player_identities(raw_players)
 
-    players = (
+    players = normalize_team_codes(
         raw_players.select(PLAYER_COLUMNS)
         .join(identities.select("gsis_id", "player_id"), on="gsis_id")
         .with_columns(pl.col("birth_date").str.to_date(strict=False))
@@ -56,8 +57,8 @@ def process_reference() -> None:
         .unique(subset=["provider", "external_id"], maintain_order=True)
         .sort("player_id", "provider")
     )
-    teams = raw_teams.select(TEAM_COLUMNS)
-    player_status = (
+    teams = normalize_team_codes(raw_teams.select(TEAM_COLUMNS))
+    player_status = normalize_team_codes(
         raw_players.select(PLAYER_STATUS_COLUMNS)
         .join(identities.select("gsis_id", "player_id"), on="gsis_id")
         .select("player_id", *PLAYER_STATUS_COLUMNS)

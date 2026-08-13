@@ -6,6 +6,7 @@ from datetime import date
 
 import polars as pl
 
+from ..normalization.team_codes import normalize_team_codes
 from ..workflows.common import validate_unique, write_outputs
 from .common import PROCESSED_DIR, current_ecr_path, ecr_archive_path, player_ids_path
 
@@ -70,7 +71,7 @@ def normalize_ranking_page(
     )
     joined = filtered.join(identity_map, on="fantasypros_id", how="left")
     unmatched = joined.filter(pl.col("player_id").is_null()).height
-    result = (
+    result = normalize_team_codes(
         joined.filter(pl.col("player_id").is_not_null())
         .select(
             "player_id",

@@ -16,6 +16,7 @@ from ..normalization.depth_charts import (
     select_current_depth_chart,
     select_historical_depth_charts,
 )
+from ..normalization.team_codes import normalize_team_codes
 from ..player_season_stats import build_player_season_stats
 from .common import (
     attach_depth_chart_player_id,
@@ -63,7 +64,9 @@ def process_season_tables(
 
     schedules_path = raw_dir / "schedules.parquet"
     raw_schedules = (
-        pl.read_parquet(schedules_path) if schedules_path.exists() else None
+        normalize_team_codes(pl.read_parquet(schedules_path))
+        if schedules_path.exists()
+        else None
     )
     if raw_schedules is not None:
         outputs["games"] = raw_schedules.select(GAME_COLUMNS).with_columns(
@@ -73,7 +76,7 @@ def process_season_tables(
     weekly_stats_path = raw_dir / "weekly_stats.parquet"
     if weekly_stats_path.exists():
         weekly_input = (
-            pl.read_parquet(weekly_stats_path)
+            normalize_team_codes(pl.read_parquet(weekly_stats_path))
             .select(WEEKLY_STAT_COLUMNS)
             .rename({"player_id": "gsis_id"})
         )
@@ -90,7 +93,9 @@ def process_season_tables(
     rosters_path = raw_dir / "weekly_rosters.parquet"
     if rosters_path.exists():
         rosters, unmatched = attach_player_id(
-            pl.read_parquet(rosters_path).select(WEEKLY_ROSTER_COLUMNS),
+            normalize_team_codes(pl.read_parquet(rosters_path)).select(
+                WEEKLY_ROSTER_COLUMNS
+            ),
             identities,
         )
         outputs["player_weekly_rosters"] = rosters.select(
@@ -106,7 +111,7 @@ def process_season_tables(
             .select("pfr_id", "player_id")
         )
         snap_counts = (
-            pl.read_parquet(snap_counts_path)
+            normalize_team_codes(pl.read_parquet(snap_counts_path))
             .select(SNAP_COUNT_COLUMNS)
             .join(
                 pfr_ids,
@@ -123,14 +128,16 @@ def process_season_tables(
 
     team_stats_path = raw_dir / "team_weekly_stats.parquet"
     if team_stats_path.exists():
-        outputs["team_weekly_stats"] = pl.read_parquet(team_stats_path).select(
-            TEAM_WEEKLY_STAT_COLUMNS
+        outputs["team_weekly_stats"] = normalize_team_codes(
+            pl.read_parquet(team_stats_path)
+        ).select(
+            TEAM_WEEKLY_STAT_COLUMNS,
         )
 
     depth_path = raw_dir / "depth_charts.parquet"
     if depth_path.exists():
-        depth_charts = normalize_depth_charts(
-            pl.read_parquet(depth_path), season
+        depth_charts = normalize_team_codes(
+            normalize_depth_charts(pl.read_parquet(depth_path), season)
         )
         if historical:
             if raw_schedules is None:
