@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from .config import DEFAULT_EMBEDDING_MODEL, DEFAULT_INDEX_PATH
-from .documents import ReportDocument
+from ..config import DEFAULT_EMBEDDING_MODEL, DEFAULT_INDEX_PATH
+from ..documents import ReportDocument
 from .embeddings import embed_texts
 
 

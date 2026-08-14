@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from .config import PROJECT_ROOT
+from ..config import PROJECT_ROOT
 
 
 def embed_texts(

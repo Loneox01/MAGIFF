@@ -7,18 +7,30 @@ from .config import (
     DEFAULT_ESCALATION_MODEL,
     DEFAULT_INDEX_PATH,
     DEFAULT_PLANNER_MODEL,
+    DEFAULT_RERANK_CANDIDATES,
+    DEFAULT_RERANK_MODEL,
 )
 from .documents import load_reports
 from .evaluation import CASES, evaluate_retrieval
-from .executor import QueryPlanExecutor
-from .planner import QueryPlanResult, QueryPlanner
-from .resolver import EntityResolver, ResolutionResult
-from .router import (
+from .planning.planner import QueryPlanResult, QueryPlanner
+from .planning.resolver import (
+    EntityResolver,
+    ResolutionResult,
+    ResolutionValidationError,
+    validate_resolution_bounds,
+)
+from .planning.router import (
     MAX_ESCALATION_DATABASE_CANDIDATES,
     EscalationEvent,
     EscalationRouter,
 )
-from .store import LocalRAGStore, SearchHit
+from .retrieval.executor import QueryPlanExecutor
+from .retrieval.reranker import (
+    MAX_RERANK_CANDIDATES,
+    ReportReranker,
+    RerankResult,
+)
+from .retrieval.store import LocalRAGStore, SearchHit
 
 
 def _add_index_path(parser: argparse.ArgumentParser) -> None:
@@ -111,6 +123,31 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--season", type=int)
     search_parser.add_argument("--document-type")
     search_parser.add_argument("--storyline")
+    search_parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="Use one batched model call to rerank a larger candidate pool",
+    )
+    search_parser.add_argument(
+        "--show-rerank",
+        action="store_true",
+        help="Print per-document reranker judgments (also enables reranking)",
+    )
+    search_parser.add_argument(
+        "--rerank-model",
+        default=DEFAULT_RERANK_MODEL,
+    )
+    search_parser.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=DEFAULT_RERANK_CANDIDATES,
+        help="Number of retrieved reports sent to the batched reranker",
+    )
+    search_parser.add_argument(
+        "--refresh-rerank",
+        action="store_true",
+        help="Ignore a cached reranker response",
+    )
     _add_planner_options(search_parser, include_enable_flag=True)
     _add_index_path(search_parser)
 
@@ -159,10 +196,18 @@ def _print_hit(index: int, hit: SearchHit) -> None:
 
 def _print_plan(result: QueryPlanResult, *, include_json: bool) -> None:
     cache_status = "cache hit" if result.cached else "cache miss"
+    scope_status = (
+        f" | scope repair attempts {result.scope_retries}"
+        if result.scope_retries
+        else ""
+    )
     print(
         f"Planner: {result.model} | {cache_status} | "
         f"input tokens {result.input_tokens} | output tokens {result.output_tokens}"
+        f"{scope_status}"
     )
+    for issue in result.scope_issues:
+        print(f"  Scope review remains: {issue}")
     if include_json:
         print(result.plan.model_dump_json(indent=2))
 
@@ -239,6 +284,48 @@ def _print_escalation(event: EscalationEvent) -> None:
         print(f"  Fallback failed; retaining Luna plan: {event.error}")
 
 
+def _print_rerank(result: RerankResult, *, include_judgments: bool) -> None:
+    request_status = "cache hit" if result.cached else (
+        "API call" if result.api_called else "no call"
+    )
+    cost = (
+        f"${result.estimated_cost_usd:.6f}"
+        if result.estimated_cost_usd is not None
+        else "not configured"
+    )
+    changed = "yes" if result.ranking_changed else "no"
+    print(
+        f"Reranker: {result.model} | {request_status} | "
+        f"candidates {result.candidate_count} -> {len(result.hits)} | "
+        f"input tokens {result.input_tokens} "
+        f"({result.cached_input_tokens} cached) | "
+        f"output tokens {result.output_tokens} | "
+        f"estimated cost {cost} | latency {result.latency_ms}ms | "
+        f"ranking changed {changed}"
+    )
+    print(
+        f"  Evidence: {result.evidence_sufficiency} | "
+        f"{result.sufficiency_reason}"
+    )
+    if result.error:
+        print(f"  Reranking failed; original order retained: {result.error}")
+    if include_judgments:
+        for item in result.ranked_candidates:
+            disposition = (
+                f"selected #{item.final_rank}"
+                if item.final_rank is not None
+                else "excluded"
+            )
+            print(
+                f"  {disposition} (retrieval #{item.original_rank}) "
+                f"{item.hit.document.id} | "
+                f"relevance {item.judgment.relevance_score}/100 | "
+                f"{item.judgment.relationship} | "
+                f"{item.judgment.temporal_role} | "
+                f"{item.judgment.reason}"
+            )
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -257,6 +344,19 @@ def main() -> None:
             print(f"New embeddings generated: {result.generated_embedding_count}")
 
         elif args.command == "search":
+            if args.show_rerank:
+                args.rerank = True
+            if args.rerank:
+                args.use_planner = True
+                if args.rerank_candidates < args.limit:
+                    raise ValueError(
+                        "--rerank-candidates must be at least --limit"
+                    )
+                if args.rerank_candidates > MAX_RERANK_CANDIDATES:
+                    raise ValueError(
+                        "--rerank-candidates cannot exceed "
+                        f"{MAX_RERANK_CANDIDATES}"
+                    )
             if args.show_plan and not args.use_planner:
                 raise ValueError("--show-plan requires --use-planner")
             if args.show_resolution and not args.use_planner:
@@ -289,6 +389,7 @@ def main() -> None:
             if plan_result is not None:
                 resolver = EntityResolver()
                 resolution = resolver.resolve(plan_result.plan)
+                validate_resolution_bounds(resolution)
                 active_plan = plan_result.plan
                 if not args.no_escalation:
                     routing = EscalationRouter(
@@ -312,7 +413,9 @@ def main() -> None:
                     active_plan,
                     resolution,
                     mode=args.mode,
-                    limit=args.limit,
+                    limit=(
+                        args.rerank_candidates if args.rerank else args.limit
+                    ),
                     embedding_model=args.embedding_model,
                     manual_filters=filters,
                 )
@@ -322,6 +425,23 @@ def main() -> None:
                     print(
                         f"Executor: {execution.strategy} | "
                         f"new document-player links {execution.linked_document_entities}"
+                    )
+                if args.rerank:
+                    rerank_result = ReportReranker(
+                        index_path=args.index_path,
+                        model=args.rerank_model,
+                    ).rerank(
+                        args.query,
+                        active_plan,
+                        resolution,
+                        hits,
+                        limit=args.limit,
+                        use_cache=not args.refresh_rerank,
+                    )
+                    hits = rerank_result.hits
+                    _print_rerank(
+                        rerank_result,
+                        include_judgments=args.show_rerank,
                     )
             else:
                 if args.mode != "keyword":
@@ -352,6 +472,7 @@ def main() -> None:
             if not args.no_escalation:
                 resolver = EntityResolver()
                 resolution = resolver.resolve(result.plan)
+                validate_resolution_bounds(resolution)
                 routing = EscalationRouter(
                     index_path=args.index_path,
                     model=args.escalation_model,
@@ -387,8 +508,18 @@ def main() -> None:
             status["escalation_router"] = EscalationRouter(
                 index_path=args.index_path
             ).stats()
+            status["reranker"] = ReportReranker(
+                index_path=args.index_path
+            ).stats()
             print(json.dumps(status, indent=2))
 
+    except ResolutionValidationError as error:
+        parser.exit(
+            1,
+            "Retrieval stopped: plan_validation_failed\n"
+            f"Code: {error.code}\n"
+            f"Reason: {error}\n",
+        )
     except (FileNotFoundError, ValueError, RuntimeError) as error:
         parser.exit(1, f"Error: {error}\n")
 

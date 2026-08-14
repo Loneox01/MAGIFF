@@ -16,7 +16,7 @@ from typing import Literal
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 
-from .config import (
+from ..config import (
     DEFAULT_ESCALATION_MODEL,
     DEFAULT_INDEX_PATH,
     ESCALATION_CACHED_INPUT_COST_PER_MILLION,

@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .planner import QueryPlan
-from .resolver import ResolutionResult, ResolvedEntity
+from ..planning.planner import QueryPlan
+from ..planning.resolver import ResolutionResult, ResolvedEntity
 from .store import LocalRAGStore, SearchHit
 
 

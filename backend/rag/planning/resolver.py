@@ -20,10 +20,28 @@ from .planner import (
     PlayerSelector,
     QueryPlan,
     TeamSelector,
+    TeamCodeFilter,
 )
 
 
 MAX_RESOLVED_ENTITIES = 200
+
+# Reference data intentionally preserves historical franchises. For seasons in
+# which a relocation has already happened, resolve the old code to the active
+# franchise and deduplicate it with the current row.
+FRANCHISE_RELOCATIONS = {
+    "OAK": ("LV", 2020),
+    "SD": ("LAC", 2017),
+    "STL": ("LA", 2016),
+}
+
+
+class ResolutionValidationError(RuntimeError):
+    """Temporary typed boundary for unsafe resolved retrieval plans."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -149,6 +167,26 @@ class ResolutionResult(BaseModel):
         )
 
 
+def validate_resolution_bounds(result: ResolutionResult) -> None:
+    """Stop an incomplete player-group lookup from becoming a hard filter."""
+    truncated_groups = [
+        selector_result.selector.reference_text
+        for selector_result in result.selectors
+        if selector_result.selector.entity_type == "player"
+        and not selector_result.selector.names
+        and selector_result.truncated
+    ]
+    if not truncated_groups:
+        return
+
+    references = ", ".join(repr(value) for value in truncated_groups)
+    raise ResolutionValidationError(
+        "unbounded_player_group",
+        f"Player group {references} exceeded the safe resolution limit. "
+        "Its objective scope must be made more specific before retrieval.",
+    )
+
+
 def _unique_entities(entities) -> list[ResolvedEntity]:
     unique: dict[tuple[str, str], ResolvedEntity] = {}
     for entity in entities:
@@ -260,13 +298,10 @@ class SupabaseEntityRepository:
                 )
             return query.limit(MAX_RESOLVED_ENTITIES + 1).execute().data
 
-        base_is_constrained = bool(names or player_filters or status_filters)
-        ids_for_query = None if base_is_constrained else candidate_ids
-
         if not names:
-            if ids_for_query is not None and len(ids_for_query) > 50:
+            if candidate_ids is not None and len(candidate_ids) > 50:
                 rows_by_id: dict[str, dict] = {}
-                ordered_ids = sorted(ids_for_query)
+                ordered_ids = sorted(candidate_ids)
                 for start in range(0, len(ordered_ids), 50):
                     batch = set(ordered_ids[start : start + 50])
                     for row in execute(None, ids=batch):
@@ -275,16 +310,16 @@ class SupabaseEntityRepository:
                         break
                 rows = list(rows_by_id.values())
             else:
-                rows = execute(None, ids=ids_for_query)
+                rows = execute(None, ids=candidate_ids)
             if candidate_ids is not None:
                 rows = [row for row in rows if row["player_id"] in candidate_ids]
             return rows
 
         rows_by_id: dict[str, dict] = {}
         for name in names:
-            matched = execute(name, ids=ids_for_query)
+            matched = execute(name)
             if not matched and " " not in name.strip():
-                matched = execute(name, "last_name", ids=ids_for_query)
+                matched = execute(name, "last_name")
             for row in matched:
                 if candidate_ids is None or row["player_id"] in candidate_ids:
                     rows_by_id[row["player_id"]] = row
@@ -339,6 +374,53 @@ class SupabaseEntityRepository:
             )
 
         return candidate_ids, unresolved
+
+    def _current_team_candidate_ids(
+        self,
+        filters: list[EntityFilter],
+        *,
+        season: int | None,
+    ) -> tuple[set[str], list[str]]:
+        """Resolve active team membership from the current depth-chart snapshot."""
+        allowed_teams: set[str] | None = None
+        unresolved: list[str] = []
+        for item in filters:
+            values = {str(value) for value in item.values}
+            if item.operator not in {"eq", "in"}:
+                unresolved.append("team: current team lookup only supports eq/in")
+                continue
+            allowed_teams = (
+                values if allowed_teams is None else allowed_teams & values
+            )
+
+        if not allowed_teams or unresolved:
+            return set(), unresolved
+
+        selected_season = season
+        if selected_season is None:
+            newest = (
+                self.client.table("current_depth_chart_entries")
+                .select("season")
+                .in_("team", sorted(allowed_teams))
+                .order("season", desc=True)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if not newest:
+                return set(), []
+            selected_season = int(newest[0]["season"])
+
+        rows = (
+            self.client.table("current_depth_chart_entries")
+            .select("player_id")
+            .eq("season", selected_season)
+            .in_("team", sorted(allowed_teams))
+            .limit(5000)
+            .execute()
+            .data
+        )
+        return {row["player_id"] for row in rows if row.get("player_id")}, []
 
     def _historical_team_candidate_ids(
         self,
@@ -399,12 +481,18 @@ class SupabaseEntityRepository:
                 continue
             supported.append(item)
 
+        team_filters = [item for item in supported if item.field == "team"]
+        current_team_filters: list[EntityFilter] = []
         historical_team_filters: list[EntityFilter] = []
-        if season is not None and season < date.today().year:
-            historical_team_filters = [
-                item for item in supported if item.field == "team"
-            ]
-            supported = [item for item in supported if item.field != "team"]
+        if team_filters:
+            if not selector.names and (
+                season is None or season >= date.today().year
+            ):
+                current_team_filters = team_filters
+            elif season is not None and season < date.today().year:
+                historical_team_filters = team_filters
+            if current_team_filters or historical_team_filters:
+                supported = [item for item in supported if item.field != "team"]
 
         candidate_ids, advanced_unresolved = self._advanced_candidate_ids(
             supported,
@@ -412,6 +500,17 @@ class SupabaseEntityRepository:
             week=week,
         )
         unresolved.extend(advanced_unresolved)
+        if current_team_filters:
+            current_ids, current_unresolved = self._current_team_candidate_ids(
+                current_team_filters,
+                season=season,
+            )
+            unresolved.extend(current_unresolved)
+            candidate_ids = (
+                current_ids
+                if candidate_ids is None
+                else candidate_ids & current_ids
+            )
         if historical_team_filters and season is not None:
             historical_ids, historical_unresolved = (
                 self._historical_team_candidate_ids(
@@ -463,7 +562,33 @@ class EntityResolver:
                 aliases[normalized].append(team)
         return teams, aliases
 
-    def _resolve_team_values(self, values: list[str]) -> tuple[list[str], list[str]]:
+    @staticmethod
+    def _canonical_team_code(team_code: str, season: int | None) -> str:
+        relocation = FRANCHISE_RELOCATIONS.get(team_code)
+        if relocation is None:
+            return team_code
+        current_code, first_season = relocation
+        if season is None or season >= first_season:
+            return current_code
+        return team_code
+
+    def _canonical_team_candidates(
+        self,
+        candidates: list[dict],
+        all_teams: list[dict],
+        *,
+        season: int | None,
+    ) -> dict[str, dict]:
+        rows_by_code = {str(team["team_abbr"]): team for team in all_teams}
+        canonical: dict[str, dict] = {}
+        for team in candidates:
+            code = self._canonical_team_code(str(team["team_abbr"]), season)
+            canonical[code] = rows_by_code.get(code, team)
+        return canonical
+
+    def _resolve_team_values(
+        self, values: list[str], *, season: int | None
+    ) -> tuple[list[str], list[str]]:
         _, aliases = self._team_aliases()
         resolved: list[str] = []
         unresolved: list[str] = []
@@ -471,13 +596,19 @@ class EntityResolver:
             matches = aliases.get(_normalize_team_text(value), [])
             unique = {str(match["team_abbr"]): match for match in matches}
             if len(unique) == 1:
-                resolved.append(next(iter(unique)))
+                resolved.append(
+                    self._canonical_team_code(next(iter(unique)), season)
+                )
             else:
                 unresolved.append(value)
         return list(dict.fromkeys(resolved)), unresolved
 
     def _resolve_team_selector(
-        self, selector: TeamSelector, selector_index: int
+        self,
+        selector: TeamSelector,
+        selector_index: int,
+        *,
+        season: int | None,
     ) -> SelectorResolution:
         teams, aliases = self._team_aliases()
         candidates = {str(team["team_abbr"]): team for team in teams}
@@ -509,6 +640,12 @@ class EntityResolver:
                 if _normalize_team_text(str(team.get(column, ""))) in normalized_values
             }
 
+        candidates = self._canonical_team_candidates(
+            list(candidates.values()),
+            teams,
+            season=season,
+        )
+
         matches = [
             ResolvedEntity(
                 entity_type="team",
@@ -530,19 +667,65 @@ class EntityResolver:
         )
 
     def _normalize_player_selector(
-        self, selector: PlayerSelector
+        self, selector: PlayerSelector, *, season: int | None
     ) -> tuple[PlayerSelector, list[str]]:
-        filters: list[EntityFilter] = []
+        filters = []
         unresolved: list[str] = []
+        team_scopes: list[set[str]] = []
         for item in selector.filters:
+            if item.field in {"conference", "division"}:
+                teams = self.repository.list_teams()
+                column = TEAM_FILTER_FIELDS[item.field]
+                normalized_values = {
+                    _normalize_team_text(str(value)) for value in item.values
+                }
+                matched = [
+                    team
+                    for team in teams
+                    if _normalize_team_text(str(team.get(column, "")))
+                    in normalized_values
+                ]
+                codes = sorted(
+                    self._canonical_team_candidates(
+                        matched,
+                        teams,
+                        season=season,
+                    )
+                )
+                if codes:
+                    team_scopes.append(set(codes))
+                else:
+                    unresolved.append(
+                        f"{item.field}: could not resolve {item.values!r}"
+                    )
+                continue
             if item.field != "team":
                 filters.append(item)
                 continue
-            values, missing = self._resolve_team_values(item.values)
+            values, missing = self._resolve_team_values(
+                item.values,
+                season=season,
+            )
             if values:
-                filters.append(item.model_copy(update={"values": values}))
+                team_scopes.append(set(values))
             unresolved.extend(f"team: could not resolve {value!r}" for value in missing)
-        return selector.model_copy(update={"filters": filters}), unresolved
+
+        if team_scopes:
+            team_codes = sorted(set.intersection(*team_scopes))
+            if team_codes:
+                filters.append(
+                    TeamCodeFilter(
+                        field="team",
+                        operator="in",
+                        values=team_codes,
+                    )
+                )
+            else:
+                unresolved.append("team: structured scopes do not overlap")
+        normalized = PlayerSelector.model_validate(
+            {**selector.model_dump(), "filters": filters}
+        )
+        return normalized, unresolved
 
     @staticmethod
     def _selectors_with_mentions(plan: QueryPlan) -> list[EntitySelector]:
@@ -588,10 +771,19 @@ class EntityResolver:
         results: list[SelectorResolution] = []
         for index, selector in enumerate(self._selectors_with_mentions(plan)):
             if selector.entity_type == "team":
-                results.append(self._resolve_team_selector(selector, index))
+                results.append(
+                    self._resolve_team_selector(
+                        selector,
+                        index,
+                        season=plan.season,
+                    )
+                )
                 continue
 
-            normalized, team_errors = self._normalize_player_selector(selector)
+            normalized, team_errors = self._normalize_player_selector(
+                selector,
+                season=plan.season,
+            )
             requires_identity = (
                 normalized.resolution_basis
                 != PlayerResolutionBasis.NOT_APPLICABLE

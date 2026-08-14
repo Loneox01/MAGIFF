@@ -11,7 +11,7 @@ from typing import Literal
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import DEFAULT_INDEX_PATH, DEFAULT_PLANNER_MODEL
+from ..config import DEFAULT_INDEX_PATH, DEFAULT_PLANNER_MODEL
 from .schema_values import (
     Conference,
     DepthChartPosition,
@@ -27,12 +27,12 @@ from .schema_values import (
 )
 
 
-PLANNER_PROMPT_VERSION = "9"
+PLANNER_PROMPT_VERSION = "11"
 
 PLANNER_INSTRUCTIONS = """Plan evidence retrieval from a fantasy-football report corpus.
 
 Return a retrieval plan, not an answer. Do not assert that an event occurred or
-invent entities, dates, attributes, or relationships.
+invent entities, dates, attributes, or relationships. Do not include conversational text.
 
 Interpret the complete user question:
 - preserve its subjects, comparisons, exclusions, uncertainty, and time scope
@@ -56,6 +56,16 @@ Build focused retrieval inputs:
 - mentions: official candidate names only, without aliases or duplicates
 - selectors: one per independently selected or compared entity; use only fields,
   values, operators, and entity combinations permitted by the schema
+- keep every objective constraint describing the same player or player group in
+  that player selector; a separate team selector or team_mentions entry does
+  not constrain a player selector
+- use a team selector only when the team itself is independently selected or
+  compared; when a team limits a player group, express that relationship with
+  a team filter inside the player selector
+- when teams are selected according to a condition about a player group or
+  position-specific role, represent both subjects: use a team selector for the
+  teams being selected and a player-group selector containing the relevant
+  position or attribute constraints plus its team, division, or conference scope
 - player selectors: follow the player-reference rules above and never put
   identity uncertainty or resolution instructions in either search query
 - structured filters: objective constraints suitable for exact database lookup
@@ -65,7 +75,8 @@ Build focused retrieval inputs:
 Represent time deliberately. Use latest/current for present-status questions,
 date boundaries when supplied, and timeline for change across time. Resolve an
 unambiguous partial date using the supplied current date. Set needs_baseline when
-the requested conclusion requires both earlier and later evidence.
+the requested conclusion requires both earlier and later evidence. Do not set
+start and end dates unless provided in the user prompt.
 
 Choose the smallest evidence strategy that can answer the whole question:
 single_document for one sufficient report, multiple_documents for synthesis or
@@ -241,6 +252,8 @@ PlayerFilter = (
     | OpponentFilter
     | OpenTextFilter
     | NumericFilter
+    | ConferenceFilter
+    | DivisionFilter
 )
 TeamFilter = ConferenceFilter | DivisionFilter
 EntityFilter = PlayerFilter | TeamFilter
@@ -337,6 +350,38 @@ class QueryPlanResult:
     cached: bool
     input_tokens: int
     output_tokens: int
+    scope_retries: int = 0
+    scope_issues: tuple[str, ...] = ()
+
+
+def _scope_review_issues(plan: QueryPlan) -> tuple[str, ...]:
+    """Identify plans that may have detached a team from a player group.
+
+    This only requests a model review. It does not assume a relationship or
+    mutate selectors because separate team and league-wide player subjects can
+    be valid in comparison questions.
+    """
+    has_team_context = bool(plan.team_mentions) or any(
+        selector.entity_type == "team" for selector in plan.entity_selectors
+    )
+    if not has_team_context:
+        return ()
+
+    issues = []
+    for index, selector in enumerate(plan.entity_selectors):
+        if selector.entity_type != "player" or selector.names:
+            continue
+        has_team_scope = any(
+            item.field in {"team", "conference", "division"}
+            for item in selector.filters
+        )
+        if not has_team_scope:
+            issues.append(
+                f"player-group selector {index} has no team, division, or "
+                "conference scope while the "
+                "plan contains separate team context"
+            )
+    return tuple(issues)
 
 
 class QueryPlanner:
@@ -419,6 +464,66 @@ class QueryPlanner:
             )
             connection.commit()
 
+    def _request_plan(
+        self,
+        client: OpenAI,
+        query: str,
+        current_date: date,
+        *,
+        previous_plan: QueryPlan | None = None,
+        scope_issues: tuple[str, ...] = (),
+    ) -> tuple[QueryPlan, int, int]:
+        messages = [
+            {"role": "system", "content": PLANNER_INSTRUCTIONS},
+            {
+                "role": "user",
+                "content": (
+                    f"Current date: {current_date.isoformat()}\n"
+                    f"Question: {query}"
+                ),
+            },
+        ]
+        if previous_plan is not None:
+            issue_text = "\n".join(f"- {issue}" for issue in scope_issues)
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": previous_plan.model_dump_json(),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Review the selector relationships in the previous "
+                            "plan and return a complete plan. Potential issue:\n"
+                            f"{issue_text}\n"
+                            "If the team constrains the player group, place the "
+                            "team filter inside that player selector. If the "
+                            "team and player group are independent subjects, "
+                            "preserve them independently. Do not merge scopes "
+                            "automatically."
+                        ),
+                    },
+                ]
+            )
+
+        response = client.responses.parse(
+            model=self.model,
+            reasoning={"effort": "none"},
+            input=messages,
+            text_format=QueryPlan,
+        )
+        plan = response.output_parsed
+        if plan is None:
+            raise RuntimeError("Query planner returned no structured plan")
+
+        usage = response.usage
+        return (
+            plan,
+            usage.input_tokens if usage else 0,
+            usage.output_tokens if usage else 0,
+        )
+
     def plan(
         self,
         query: str,
@@ -446,34 +551,35 @@ class QueryPlanner:
 
         try:
             client = self.client or OpenAI()
-            response = client.responses.parse(
-                model=self.model,
-                reasoning={"effort": "none"},
-                input=[
-                    {"role": "system", "content": PLANNER_INSTRUCTIONS},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Current date: {current_date.isoformat()}\n"
-                            f"Question: {normalized_query}"
-                        ),
-                    },
-                ],
-                text_format=QueryPlan,
+            plan, input_tokens, output_tokens = self._request_plan(
+                client,
+                normalized_query,
+                current_date,
             )
+            scope_retries = 0
+            scope_issues = _scope_review_issues(plan)
+            if scope_issues:
+                plan, retry_input_tokens, retry_output_tokens = self._request_plan(
+                    client,
+                    normalized_query,
+                    current_date,
+                    previous_plan=plan,
+                    scope_issues=scope_issues,
+                )
+                input_tokens += retry_input_tokens
+                output_tokens += retry_output_tokens
+                scope_retries = 1
+                scope_issues = _scope_review_issues(plan)
         except Exception as error:
             raise RuntimeError(f"Query planner request failed: {error}") from error
 
-        plan = response.output_parsed
-        if plan is None:
-            raise RuntimeError("Query planner returned no structured plan")
-
         self._cache_plan(query_hash, current_date, plan)
-        usage = response.usage
         return QueryPlanResult(
             plan=plan,
             model=self.model,
             cached=False,
-            input_tokens=usage.input_tokens if usage else 0,
-            output_tokens=usage.output_tokens if usage else 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            scope_retries=scope_retries,
+            scope_issues=scope_issues,
         )

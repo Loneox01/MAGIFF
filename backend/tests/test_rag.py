@@ -1,18 +1,21 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from rag.documents import parse_report
-from rag.executor import QueryPlanExecutor
+from rag.documents import load_reports, parse_report
+from rag.retrieval.executor import QueryPlanExecutor
 from pydantic import ValidationError
 import polars as pl
 
 from processing.normalization.team_codes import normalize_team_codes
-from rag.planner import (
+from rag.planning.planner import (
+    ConferenceFilter,
+    DivisionFilter,
     NumericFilter,
     PlayerResolutionBasis,
     PlayerSelector,
@@ -23,14 +26,25 @@ from rag.planner import (
     TeamCodeFilter,
     TeamSelector,
 )
-from rag.resolver import (
+from rag.planning.resolver import (
     EntityResolver,
     ResolutionResult,
+    ResolutionValidationError,
     ResolvedEntity,
     SelectorResolution,
+    SupabaseEntityRepository,
+    validate_resolution_bounds,
 )
-from rag.store import LocalRAGStore
-from rag.router import (
+from rag.retrieval.reranker import (
+    EvidenceRelationship,
+    EvidenceSufficiency,
+    ReportReranker,
+    RerankJudgment,
+    RerankResponse,
+    TemporalRole,
+)
+from rag.retrieval.store import LocalRAGStore, SearchHit
+from rag.planning.router import (
     EscalationRouter,
     PlayerIdentityDecision,
     PlayerIdentityResponse,
@@ -106,6 +120,50 @@ class RagTests(unittest.TestCase):
             self.assertEqual(result.embedded_count, 0)
             self.assertEqual(hits[0].document.id, "alpha-update")
 
+    def test_load_reports_inherits_base_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            reports_root = Path(directory)
+            base_dir = reports_root / "2026-08-09"
+            current_dir = reports_root / "2026-08-13"
+            base_dir.mkdir()
+            current_dir.mkdir()
+
+            (base_dir / "alpha.md").write_text(REPORT, encoding="utf-8")
+            (base_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "document_count": 1,
+                        "documents": [{"id": "alpha-update", "path": "alpha.md"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            beta_report = REPORT.replace("alpha-update", "beta-update").replace(
+                "Alpha", "Beta"
+            )
+            (current_dir / "beta.md").write_text(beta_report, encoding="utf-8")
+            (current_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "base_snapshot": "2026-08-09",
+                        "document_count": 2,
+                        "documents": [{"id": "beta-update", "path": "beta.md"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            documents = load_reports(
+                snapshot="2026-08-13",
+                reports_root=reports_root,
+            )
+
+            self.assertEqual(
+                [document.id for document in documents],
+                ["alpha-update", "beta-update"],
+            )
+
     def test_cosine_similarity(self) -> None:
         score = LocalRAGStore._cosine_similarity([1.0, 0.0], [1.0, 0.0])
         opposite = LocalRAGStore._cosine_similarity([1.0, 0.0], [-1.0, 0.0])
@@ -122,7 +180,7 @@ class RagTests(unittest.TestCase):
             store = LocalRAGStore(root / "index.sqlite3")
 
             with patch(
-                "rag.store.embed_texts",
+                "rag.retrieval.store.embed_texts",
                 side_effect=[[[1.0, 0.0]], [[1.0, 0.0]]],
             ) as mocked_embed:
                 result = store.build_index([document], with_embeddings=True)
@@ -143,7 +201,7 @@ class RagTests(unittest.TestCase):
             store = LocalRAGStore(root / "index.sqlite3")
 
             with patch(
-                "rag.store.embed_texts",
+                "rag.retrieval.store.embed_texts",
                 side_effect=[[[1.0, 0.0]], [[1.0, 0.0]]],
             ) as mocked_embed:
                 store.build_index([document], with_embeddings=True)
@@ -218,6 +276,359 @@ class RagTests(unittest.TestCase):
             self.assertTrue(second.cached)
             self.assertEqual(second.input_tokens, 0)
             self.assertEqual(second.plan, plan)
+
+    def test_query_planner_retries_separated_team_and_player_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            player_group = PlayerSelector(
+                entity_type="player",
+                reference_text="running back",
+                names=[],
+                identity_confidence=0,
+                resolution_basis=PlayerResolutionBasis.NOT_APPLICABLE,
+                filters=[
+                    PositionGroupFilter(
+                        field="position_group",
+                        operator="eq",
+                        values=["RB"],
+                    )
+                ],
+                semantic_qualifiers=["lead the backfield"],
+            )
+            team_selector = TeamSelector(
+                entity_type="team",
+                names=["LAC"],
+                filters=[],
+                semantic_qualifiers=[],
+            )
+            initial_plan = QueryPlan(
+                semantic_query="Identify the Chargers lead running back.",
+                keyword_query="Chargers lead running back",
+                intent="projection",
+                player_mentions=[],
+                team_mentions=["LAC"],
+                negative_focus=[],
+                entity_selectors=[team_selector, player_group],
+                season=2026,
+                week=None,
+                temporal_mode="current",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="single_document",
+            )
+            repaired_group = player_group.model_copy(
+                update={
+                    "filters": [
+                        TeamCodeFilter(
+                            field="team",
+                            operator="eq",
+                            values=["LAC"],
+                        ),
+                        *player_group.filters,
+                    ]
+                }
+            )
+            repaired_plan = initial_plan.model_copy(
+                update={"entity_selectors": [repaired_group]}
+            )
+            responses = Mock(
+                side_effect=[
+                    SimpleNamespace(
+                        output_parsed=initial_plan,
+                        usage=SimpleNamespace(input_tokens=50, output_tokens=20),
+                    ),
+                    SimpleNamespace(
+                        output_parsed=repaired_plan,
+                        usage=SimpleNamespace(input_tokens=70, output_tokens=25),
+                    ),
+                ]
+            )
+            planner = QueryPlanner(
+                index_path=Path(directory) / "index.sqlite3",
+                model="test-planner",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=responses)
+                ),
+            )
+
+            result = planner.plan(
+                "Which Chargers running back will lead the backfield?",
+                planning_date=date(2026, 8, 13),
+            )
+
+            self.assertEqual(responses.call_count, 2)
+            self.assertEqual(result.scope_retries, 1)
+            self.assertEqual(result.scope_issues, ())
+            self.assertEqual(result.input_tokens, 120)
+            self.assertEqual(result.output_tokens, 45)
+            repaired_selector = result.plan.entity_selectors[0]
+            self.assertEqual(repaired_selector.entity_type, "player")
+            self.assertTrue(
+                any(item.field == "team" for item in repaired_selector.filters)
+            )
+            retry_messages = responses.call_args_list[1].kwargs["input"]
+            self.assertIn(
+                "Do not merge scopes automatically",
+                retry_messages[-1]["content"],
+            )
+
+    def test_truncated_player_group_stops_before_retrieval(self) -> None:
+        group = PlayerSelector(
+            entity_type="player",
+            reference_text="running backs",
+            names=[],
+            identity_confidence=0,
+            resolution_basis=PlayerResolutionBasis.NOT_APPLICABLE,
+            filters=[
+                PositionGroupFilter(
+                    field="position_group",
+                    operator="eq",
+                    values=["RB"],
+                )
+            ],
+            semantic_qualifiers=[],
+        )
+        resolution = ResolutionResult(
+            selectors=[
+                SelectorResolution(
+                    selector_index=0,
+                    selector=group,
+                    status="multiple",
+                    matches=[],
+                    unresolved_filters=[],
+                    semantic_qualifiers=[],
+                    truncated=True,
+                )
+            ]
+        )
+
+        with self.assertRaises(ResolutionValidationError) as raised:
+            validate_resolution_bounds(resolution)
+
+        self.assertEqual(raised.exception.code, "unbounded_player_group")
+
+    def test_current_team_player_group_uses_current_membership(self) -> None:
+        class TrackingRepository(SupabaseEntityRepository):
+            def __init__(self) -> None:
+                self.current_filters = None
+                self.base_filters = None
+                self.candidate_ids = None
+
+            def _current_team_candidate_ids(self, filters, *, season):
+                self.current_filters = filters
+                return {"current-rb-id"}, []
+
+            def _advanced_candidate_ids(self, filters, *, season, week):
+                return None, []
+
+            def _base_player_rows(self, names, filters, candidate_ids):
+                self.base_filters = filters
+                self.candidate_ids = candidate_ids
+                return [
+                    {
+                        "player_id": "current-rb-id",
+                        "display_name": "Current Runner",
+                        "position": "RB",
+                        "position_group": "RB",
+                        "rookie_season": 2025,
+                        "draft_year": 2025,
+                        "player_status": {
+                            "latest_team": "LAC",
+                            "jersey_number": "1",
+                            "status": "ACT",
+                        },
+                    }
+                ]
+
+        repository = TrackingRepository()
+        selector = PlayerSelector(
+            entity_type="player",
+            reference_text="Chargers running backs",
+            names=[],
+            identity_confidence=0,
+            resolution_basis=PlayerResolutionBasis.NOT_APPLICABLE,
+            filters=[
+                TeamCodeFilter(field="team", operator="eq", values=["LAC"]),
+                PositionGroupFilter(
+                    field="position_group",
+                    operator="eq",
+                    values=["RB"],
+                ),
+            ],
+            semantic_qualifiers=[],
+        )
+
+        rows, unresolved, truncated = repository.resolve_player_selector(
+            selector,
+            season=None,
+            week=None,
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertFalse(truncated)
+        self.assertEqual(rows[0]["display_name"], "Current Runner")
+        self.assertEqual(repository.candidate_ids, {"current-rb-id"})
+        self.assertEqual(
+            [item.field for item in repository.current_filters],
+            ["team"],
+        )
+        self.assertEqual(
+            [item.field for item in repository.base_filters],
+            ["position_group"],
+        )
+
+    def test_current_division_deduplicates_historical_franchise_codes(self) -> None:
+        class FakeRepository:
+            def list_teams(self) -> list[dict]:
+                return [
+                    {
+                        "team_abbr": code,
+                        "team_id": code,
+                        "team_name": name,
+                        "team_nick": name.split()[-1],
+                        "team_conf": "AFC",
+                        "team_division": "AFC West",
+                    }
+                    for code, name in [
+                        ("DEN", "Denver Broncos"),
+                        ("KC", "Kansas City Chiefs"),
+                        ("LAC", "Los Angeles Chargers"),
+                        ("LV", "Las Vegas Raiders"),
+                        ("OAK", "Oakland Raiders"),
+                        ("SD", "San Diego Chargers"),
+                    ]
+                ]
+
+            def resolve_player_selector(self, selector, *, season, week):
+                return [], [], False
+
+        selector = TeamSelector(
+            entity_type="team",
+            names=[],
+            filters=[
+                ConferenceFilter(
+                    field="conference",
+                    operator="eq",
+                    values=["AFC"],
+                ),
+                DivisionFilter(
+                    field="division",
+                    operator="eq",
+                    values=["AFC West"],
+                ),
+            ],
+            semantic_qualifiers=[],
+        )
+        plan = QueryPlan(
+            semantic_query="AFC West teams",
+            keyword_query="AFC West",
+            intent="fact",
+            player_mentions=[],
+            team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[selector],
+            season=2026,
+            week=None,
+            temporal_mode="current",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="per_entity",
+        )
+
+        result = EntityResolver(repository=FakeRepository()).resolve(plan)
+
+        self.assertEqual(
+            [team.entity_id for team in result.teams],
+            ["DEN", "KC", "LAC", "LV"],
+        )
+        self.assertEqual(
+            [team.display_name for team in result.teams],
+            [
+                "Denver Broncos",
+                "Kansas City Chiefs",
+                "Los Angeles Chargers",
+                "Las Vegas Raiders",
+            ],
+        )
+
+    def test_player_group_division_scope_expands_to_current_teams(self) -> None:
+        class FakeRepository:
+            def __init__(self) -> None:
+                self.selector = None
+
+            def list_teams(self) -> list[dict]:
+                return [
+                    {
+                        "team_abbr": code,
+                        "team_id": code,
+                        "team_name": name,
+                        "team_nick": name.split()[-1],
+                        "team_conf": "AFC",
+                        "team_division": "AFC West",
+                    }
+                    for code, name in [
+                        ("DEN", "Denver Broncos"),
+                        ("KC", "Kansas City Chiefs"),
+                        ("LAC", "Los Angeles Chargers"),
+                        ("LV", "Las Vegas Raiders"),
+                        ("OAK", "Oakland Raiders"),
+                        ("SD", "San Diego Chargers"),
+                    ]
+                ]
+
+            def resolve_player_selector(self, selector, *, season, week):
+                self.selector = selector
+                return [], [], False
+
+        repository = FakeRepository()
+        selector = PlayerSelector(
+            entity_type="player",
+            reference_text="AFC West running backs",
+            names=[],
+            identity_confidence=0,
+            resolution_basis=PlayerResolutionBasis.NOT_APPLICABLE,
+            filters=[
+                ConferenceFilter(
+                    field="conference",
+                    operator="eq",
+                    values=["AFC"],
+                ),
+                DivisionFilter(
+                    field="division",
+                    operator="eq",
+                    values=["AFC West"],
+                ),
+                PositionGroupFilter(
+                    field="position_group",
+                    operator="eq",
+                    values=["RB"],
+                ),
+            ],
+            semantic_qualifiers=["unresolved workload"],
+        )
+        plan = QueryPlan(
+            semantic_query="unresolved AFC West running back workloads",
+            keyword_query="AFC West RB workload",
+            intent="current_status",
+            player_mentions=[],
+            team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[selector],
+            season=2026,
+            week=None,
+            temporal_mode="current",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="per_entity",
+        )
+
+        EntityResolver(repository=repository).resolve(plan)
+
+        filters = {item.field: item for item in repository.selector.filters}
+        self.assertEqual(filters["team"].values, ["DEN", "KC", "LAC", "LV"])
+        self.assertEqual(filters["position_group"].values, ["RB"])
 
     def test_entity_resolver_normalizes_team_and_resolves_attributes(self) -> None:
         class FakeRepository:
@@ -1182,6 +1593,365 @@ class RagTests(unittest.TestCase):
             "player identity could not be grounded",
             result.selectors[0].unresolved_filters,
         )
+
+    def test_reranker_batches_candidates_reorders_and_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "alpha.md"
+            report_path.write_text(REPORT, encoding="utf-8")
+            original = parse_report(report_path)
+            newer_context = replace(
+                original,
+                id="newer-context",
+                title="General team notes",
+                published_at="2026-08-10",
+                body="The team held a normal practice without an Alpha update.",
+            )
+            direct = replace(
+                original,
+                id="direct-update",
+                title="Alpha cleared",
+                published_at="2026-08-09",
+                body="Alpha Runner was cleared and returned as a full participant.",
+            )
+            hits = [
+                SearchHit(newer_context, 0.04, "hybrid", 1, 1),
+                SearchHit(direct, 0.03, "hybrid", 2, 2),
+            ]
+            plan = QueryPlan(
+                semantic_query="Alpha Runner current health",
+                keyword_query="Alpha Runner cleared practice",
+                intent="current_status",
+                player_mentions=["Alpha Runner"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[],
+                season=2026,
+                week=None,
+                temporal_mode="current",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="single_document",
+            )
+            resolution = ResolutionResult(selectors=[])
+            response = SimpleNamespace(
+                output_parsed=RerankResponse(
+                    judgments=[
+                        RerankJudgment(
+                            document_id="newer-context",
+                            relevance_score=25,
+                            relationship=EvidenceRelationship.SUPPORTING_CONTEXT,
+                            temporal_role=TemporalRole.CURRENT,
+                            redundant_with=None,
+                            reason="New but does not report Alpha's status.",
+                        ),
+                        RerankJudgment(
+                            document_id="direct-update",
+                            relevance_score=96,
+                            relationship=EvidenceRelationship.DIRECT,
+                            temporal_role=TemporalRole.CURRENT,
+                            redundant_with=None,
+                            reason="Directly states Alpha's practice clearance.",
+                        ),
+                    ],
+                    evidence_sufficiency=EvidenceSufficiency.STRONG,
+                    sufficiency_reason="One report directly answers the question.",
+                ),
+                usage=SimpleNamespace(
+                    input_tokens=200,
+                    output_tokens=60,
+                    input_tokens_details=SimpleNamespace(cached_tokens=20),
+                ),
+            )
+            client = SimpleNamespace(
+                responses=SimpleNamespace(parse=lambda **_: response)
+            )
+            reranker = ReportReranker(
+                index_path=root / "index.sqlite3",
+                model="test-luna",
+                client=client,
+            )
+
+            first = reranker.rerank(
+                "Is Alpha healthy?",
+                plan,
+                resolution,
+                hits,
+                limit=2,
+            )
+            self.assertEqual(first.hits[0].document.id, "direct-update")
+            self.assertTrue(first.ranking_changed)
+            self.assertEqual(first.input_tokens, 200)
+            self.assertEqual(first.cached_input_tokens, 20)
+            self.assertIsNone(first.error)
+
+            client.responses.parse = lambda **_: self.fail(
+                "Cached reranking should avoid a second model call"
+            )
+            second = reranker.rerank(
+                "Is Alpha healthy?",
+                plan,
+                resolution,
+                hits,
+                limit=2,
+            )
+            stats = reranker.stats()
+
+            self.assertTrue(second.cached)
+            self.assertFalse(second.api_called)
+            self.assertEqual(second.hits[0].document.id, "direct-update")
+            self.assertEqual(stats["executions"], 2)
+            self.assertEqual(stats["api_calls"], 1)
+            self.assertEqual(stats["cache_hits"], 1)
+
+    def test_reranker_rejects_invalid_ids_and_preserves_retrieval_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "alpha.md"
+            report_path.write_text(REPORT, encoding="utf-8")
+            document = parse_report(report_path)
+            hits = [SearchHit(document, 1.0, "keyword", 1, None)]
+            plan = QueryPlan(
+                semantic_query="Alpha health",
+                keyword_query="Alpha health",
+                intent="current_status",
+                player_mentions=["Alpha Runner"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[],
+                season=2026,
+                week=None,
+                temporal_mode="current",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="single_document",
+            )
+            invalid = SimpleNamespace(
+                output_parsed=RerankResponse(
+                    judgments=[
+                        RerankJudgment(
+                            document_id="invented-id",
+                            relevance_score=99,
+                            relationship=EvidenceRelationship.DIRECT,
+                            temporal_role=TemporalRole.CURRENT,
+                            redundant_with=None,
+                            reason="Invalid candidate.",
+                        )
+                    ],
+                    evidence_sufficiency=EvidenceSufficiency.STRONG,
+                    sufficiency_reason="Invalid response for testing.",
+                ),
+                usage=None,
+            )
+            reranker = ReportReranker(
+                index_path=root / "index.sqlite3",
+                model="test-luna",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=lambda **_: invalid)
+                ),
+            )
+
+            result = reranker.rerank(
+                "Is Alpha healthy?",
+                plan,
+                ResolutionResult(selectors=[]),
+                hits,
+            )
+
+            self.assertEqual(result.hits, hits)
+            self.assertIsNotNone(result.error)
+            self.assertIn("exactly the supplied document IDs", result.error)
+            self.assertEqual(reranker.stats()["failed"], 1)
+
+    def test_reranker_deterministically_preserves_timeline_endpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "alpha.md"
+            report_path.write_text(REPORT, encoding="utf-8")
+            template = parse_report(report_path)
+            baseline = replace(
+                template,
+                id="baseline",
+                published_at="2026-07-01",
+                body="Alpha began camp limited by a hamstring injury.",
+            )
+            intermediate = replace(
+                template,
+                id="intermediate",
+                published_at="2026-07-20",
+                body="Alpha continued individual rehabilitation work.",
+            )
+            current = replace(
+                template,
+                id="current",
+                published_at="2026-08-09",
+                body="Alpha returned as a full participant.",
+            )
+            hits = [
+                SearchHit(intermediate, 0.04, "hybrid", 1, 1),
+                SearchHit(current, 0.03, "hybrid", 2, 2),
+                SearchHit(baseline, 0.02, "hybrid", 3, 3),
+            ]
+            judgments = [
+                RerankJudgment(
+                    document_id="intermediate",
+                    relevance_score=99,
+                    relationship=EvidenceRelationship.DIRECT,
+                    temporal_role=TemporalRole.INTERMEDIATE,
+                    redundant_with=None,
+                    reason="Strong middle update.",
+                ),
+                RerankJudgment(
+                    document_id="current",
+                    relevance_score=80,
+                    relationship=EvidenceRelationship.DIRECT,
+                    temporal_role=TemporalRole.CURRENT,
+                    redundant_with=None,
+                    reason="Establishes the current state.",
+                ),
+                RerankJudgment(
+                    document_id="baseline",
+                    relevance_score=70,
+                    relationship=EvidenceRelationship.DIRECT,
+                    temporal_role=TemporalRole.BASELINE,
+                    redundant_with=None,
+                    reason="Establishes the earlier state.",
+                ),
+            ]
+            response = SimpleNamespace(
+                output_parsed=RerankResponse(
+                    judgments=judgments,
+                    evidence_sufficiency=EvidenceSufficiency.STRONG,
+                    sufficiency_reason="Both endpoints are present.",
+                ),
+                usage=None,
+            )
+            plan = QueryPlan(
+                semantic_query="How Alpha's health changed",
+                keyword_query="Alpha health timeline",
+                intent="timeline",
+                player_mentions=["Alpha Runner"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[],
+                season=2026,
+                week=None,
+                temporal_mode="timeline",
+                start_date="2026-07-01",
+                end_date="2026-08-09",
+                needs_baseline=True,
+                evidence_strategy="timeline",
+            )
+            reranker = ReportReranker(
+                index_path=root / "index.sqlite3",
+                model="test-luna",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=lambda **_: response)
+                ),
+            )
+
+            result = reranker.rerank(
+                "How did Alpha's health change?",
+                plan,
+                ResolutionResult(selectors=[]),
+                hits,
+                limit=2,
+            )
+
+            self.assertEqual(
+                [hit.document.id for hit in result.hits],
+                ["baseline", "current"],
+            )
+
+    def test_reranker_excludes_redundant_evidence_when_alternative_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "alpha.md"
+            report_path.write_text(REPORT, encoding="utf-8")
+            template = parse_report(report_path)
+            primary = replace(template, id="primary")
+            duplicate = replace(template, id="duplicate")
+            distinct = replace(
+                template,
+                id="distinct",
+                body="The coach separately confirmed Alpha's expected workload.",
+            )
+            hits = [
+                SearchHit(primary, 0.04, "hybrid", 1, 1),
+                SearchHit(duplicate, 0.03, "hybrid", 2, 2),
+                SearchHit(distinct, 0.02, "hybrid", 3, 3),
+            ]
+            response = SimpleNamespace(
+                output_parsed=RerankResponse(
+                    judgments=[
+                        RerankJudgment(
+                            document_id="primary",
+                            relevance_score=95,
+                            relationship=EvidenceRelationship.DIRECT,
+                            temporal_role=TemporalRole.NOT_APPLICABLE,
+                            redundant_with=None,
+                            reason="Best direct report.",
+                        ),
+                        RerankJudgment(
+                            document_id="duplicate",
+                            relevance_score=90,
+                            relationship=EvidenceRelationship.DIRECT,
+                            temporal_role=TemporalRole.NOT_APPLICABLE,
+                            redundant_with="primary",
+                            reason="Repeats the primary report.",
+                        ),
+                        RerankJudgment(
+                            document_id="distinct",
+                            relevance_score=75,
+                            relationship=EvidenceRelationship.SUPPORTING_CONTEXT,
+                            temporal_role=TemporalRole.NOT_APPLICABLE,
+                            redundant_with=None,
+                            reason="Adds separate workload evidence.",
+                        ),
+                    ],
+                    evidence_sufficiency=EvidenceSufficiency.STRONG,
+                    sufficiency_reason="Direct and corroborating evidence exists.",
+                ),
+                usage=None,
+            )
+            plan = QueryPlan(
+                semantic_query="Alpha role",
+                keyword_query="Alpha role workload",
+                intent="current_status",
+                player_mentions=["Alpha Runner"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[],
+                season=2026,
+                week=None,
+                temporal_mode="none",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="multiple_documents",
+            )
+            reranker = ReportReranker(
+                index_path=root / "index.sqlite3",
+                model="test-luna",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=lambda **_: response)
+                ),
+            )
+
+            result = reranker.rerank(
+                "What is Alpha's role?",
+                plan,
+                ResolutionResult(selectors=[]),
+                hits,
+                limit=2,
+            )
+
+            self.assertEqual(
+                [hit.document.id for hit in result.hits],
+                ["primary", "distinct"],
+            )
 
 
 if __name__ == "__main__":

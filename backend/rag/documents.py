@@ -163,30 +163,53 @@ def load_reports(
     reports_root: Path = REPORTS_ROOT,
 ) -> list[ReportDocument]:
     snapshot_dir = resolve_snapshot(snapshot=snapshot, reports_root=reports_root)
-    manifest = json.loads((snapshot_dir / "manifest.json").read_text(encoding="utf-8"))
-    documents: list[ReportDocument] = []
-    seen_ids: set[str] = set()
+    seen_snapshots: set[Path] = set()
 
-    for item in manifest.get("documents", []):
-        path = (snapshot_dir / item["path"]).resolve()
-        if snapshot_dir not in path.parents:
-            raise ValueError(f"Report path escapes snapshot directory: {item['path']}")
+    def load_snapshot(snapshot_path: Path) -> list[ReportDocument]:
+        snapshot_path = snapshot_path.resolve()
+        if snapshot_path in seen_snapshots:
+            raise ValueError(f"Snapshot inheritance cycle detected at {snapshot_path}")
+        seen_snapshots.add(snapshot_path)
 
-        document = parse_report(path)
-        if document.id != item["id"]:
-            raise ValueError(
-                f"Manifest id {item['id']!r} does not match {document.id!r} in {path}"
-            )
-        if document.id in seen_ids:
-            raise ValueError(f"Duplicate report id in manifest: {document.id}")
-
-        seen_ids.add(document.id)
-        documents.append(document)
-
-    expected_count = manifest.get("document_count")
-    if expected_count is not None and expected_count != len(documents):
-        raise ValueError(
-            f"Manifest expects {expected_count} documents; loaded {len(documents)}"
+        manifest = json.loads(
+            (snapshot_path / "manifest.json").read_text(encoding="utf-8")
         )
+        documents: list[ReportDocument] = []
 
-    return documents
+        base_snapshot = manifest.get("base_snapshot")
+        if base_snapshot is not None:
+            base_path = resolve_snapshot(
+                snapshot=str(base_snapshot),
+                reports_root=reports_root,
+            )
+            documents.extend(load_snapshot(base_path))
+
+        seen_ids = {document.id for document in documents}
+        for item in manifest.get("documents", []):
+            path = (snapshot_path / item["path"]).resolve()
+            if snapshot_path not in path.parents:
+                raise ValueError(
+                    f"Report path escapes snapshot directory: {item['path']}"
+                )
+
+            document = parse_report(path)
+            if document.id != item["id"]:
+                raise ValueError(
+                    f"Manifest id {item['id']!r} does not match "
+                    f"{document.id!r} in {path}"
+                )
+            if document.id in seen_ids:
+                raise ValueError(f"Duplicate report id in snapshot chain: {document.id}")
+
+            seen_ids.add(document.id)
+            documents.append(document)
+
+        expected_count = manifest.get("document_count")
+        if expected_count is not None and expected_count != len(documents):
+            raise ValueError(
+                f"Manifest expects {expected_count} documents; loaded {len(documents)}"
+            )
+
+        return documents
+
+    return load_snapshot(snapshot_dir)

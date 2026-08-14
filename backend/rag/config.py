@@ -24,6 +24,11 @@ DEFAULT_ESCALATION_MODEL = os.getenv(
     "OPENAI_ESCALATION_MODEL",
     "gpt-5.6-sol",
 )
+DEFAULT_RERANK_MODEL = os.getenv(
+    "OPENAI_RERANK_MODEL",
+    DEFAULT_PLANNER_MODEL,
+)
+DEFAULT_RERANK_CANDIDATES = int(os.getenv("RAG_RERANK_CANDIDATES", "15"))
 
 # Defaults reflect the model price when this router was introduced. Environment
 # overrides keep cost telemetry useful if pricing or the escalation model changes.
@@ -35,4 +40,22 @@ ESCALATION_CACHED_INPUT_COST_PER_MILLION = float(
 )
 ESCALATION_OUTPUT_COST_PER_MILLION = float(
     os.getenv("OPENAI_ESCALATION_OUTPUT_COST_PER_MILLION", "30.00")
+)
+
+
+def _optional_cost_rate(name: str) -> float | None:
+    value = os.getenv(name)
+    return float(value) if value else None
+
+
+# Reranker pricing is deliberately configuration-only. Token use is always
+# recorded; a dollar estimate is shown once all three current model rates are set.
+RERANK_INPUT_COST_PER_MILLION = _optional_cost_rate(
+    "OPENAI_RERANK_INPUT_COST_PER_MILLION"
+)
+RERANK_CACHED_INPUT_COST_PER_MILLION = _optional_cost_rate(
+    "OPENAI_RERANK_CACHED_INPUT_COST_PER_MILLION"
+)
+RERANK_OUTPUT_COST_PER_MILLION = _optional_cost_rate(
+    "OPENAI_RERANK_OUTPUT_COST_PER_MILLION"
 )
