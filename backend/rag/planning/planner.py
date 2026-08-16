@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from openai import OpenAI
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..config import DEFAULT_INDEX_PATH, DEFAULT_PLANNER_MODEL
 from .schema_values import (
@@ -27,7 +27,7 @@ from .schema_values import (
 )
 
 
-PLANNER_PROMPT_VERSION = "11"
+PLANNER_PROMPT_VERSION = "14"
 
 PLANNER_INSTRUCTIONS = """Plan evidence retrieval from a fantasy-football report corpus.
 
@@ -68,7 +68,21 @@ Build focused retrieval inputs:
   position or attribute constraints plus its team, division, or conference scope
 - player selectors: follow the player-reference rules above and never put
   identity uncertainty or resolution instructions in either search query
-- structured filters: objective constraints suitable for exact database lookup
+- hard_filters: only objective constraints explicitly stated in the question or
+  unambiguously normalized or entailed by it; hard filters may exclude evidence
+- soft_filters: optional structured context inferred from background knowledge;
+  soft filters never constrain database lookup or exclude evidence, and should
+  usually be omitted when the fact is unstable or unnecessary
+- do not copy a soft-only value into semantic_query or keyword_query unless the
+  same concept is present in the user's question; soft context must not bias the
+  candidate pool before database grounding
+- never place a player's team, position, status, or other relationship in
+  hard_filters merely because you believe it to be true; if the question does
+  not supply that relationship, either omit it or place it in soft_filters
+- team_mentions contains only teams explicitly mentioned or unambiguously
+  normalized from the question; put inferred team context in soft_team_mentions
+- database enrichment happens after planning and must not be anticipated as a
+  hard filter
 - semantic qualifiers: subjective or report-derived descriptions requiring text
   evidence rather than exact database matching
 
@@ -165,7 +179,13 @@ class DepthChartPositionFilter(PlannerModel):
 
 
 class FormationFilter(PlannerModel):
-    field: Literal[EntityFilterField.FORMATION]
+    field: Literal[EntityFilterField.FORMATION] = Field(
+        description=(
+            "Normalized depth-chart side: Offense, Defense, or Special Teams. "
+            "This is not a personnel package or a measure of snaps, usage, or "
+            "workload. It requires QueryPlan.season."
+        )
+    )
     operator: Literal["eq", "in"]
     values: list[Formation] = Field(min_length=1)
 
@@ -219,7 +239,15 @@ class NumericFilter(PlannerModel):
         EntityFilterField.CARRIES,
         EntityFilterField.RECEPTIONS,
         EntityFilterField.OFFENSE_SNAP_PCT,
-    ]
+    ] = Field(
+        description=(
+            "Numeric database field. `last_season` means the latest season "
+            "recorded for the player's career in the dataset. It is not the "
+            "season requested by the user or shorthand for the previous "
+            "season. Use it only when the question explicitly constrains that "
+            "property."
+        )
+    )
     operator: Literal["eq", "in", "gte", "lte"]
     values: list[str] = Field(
         min_length=1,
@@ -259,7 +287,29 @@ TeamFilter = ConferenceFilter | DivisionFilter
 EntityFilter = PlayerFilter | TeamFilter
 
 
-class PlayerSelector(PlannerModel):
+class FilteredSelectorModel(PlannerModel):
+    """Shared hard/soft filter boundary with legacy input migration."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_filters(cls, value):
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        legacy = migrated.pop("filters", None)
+        if "hard_filters" not in migrated:
+            migrated["hard_filters"] = legacy if legacy is not None else []
+        if "soft_filters" not in migrated:
+            migrated["soft_filters"] = []
+        return migrated
+
+    @property
+    def filters(self):
+        """Compatibility alias; execution code must use hard_filters."""
+        return self.hard_filters
+
+
+class PlayerSelector(FilteredSelectorModel):
     entity_type: Literal["player"]
     reference_text: str = Field(
         min_length=1,
@@ -287,16 +337,35 @@ class PlayerSelector(PlannerModel):
             "context, best unsupported inference, or not applicable to a group."
         )
     )
-    filters: list[PlayerFilter]
+    hard_filters: list[PlayerFilter] = Field(
+        description=(
+            "Prompt-grounded objective constraints allowed to exclude players "
+            "or reports."
+        )
+    )
+    soft_filters: list[PlayerFilter] = Field(
+        description=(
+            "Optional inferred structured context. Never used as an exclusion "
+            "constraint."
+        )
+    )
     semantic_qualifiers: list[str]
 
 
-class TeamSelector(PlannerModel):
+class TeamSelector(FilteredSelectorModel):
     entity_type: Literal["team"]
     names: list[TeamCode] = Field(
         description="Canonical codes, such as SEA, NYJ, PHI, and SF."
     )
-    filters: list[TeamFilter]
+    hard_filters: list[TeamFilter] = Field(
+        description="Prompt-grounded constraints allowed to exclude teams."
+    )
+    soft_filters: list[TeamFilter] = Field(
+        description=(
+            "Optional inferred team context. Never used as an exclusion "
+            "constraint."
+        )
+    )
     semantic_qualifiers: list[str]
 
 
@@ -304,6 +373,16 @@ EntitySelector = PlayerSelector | TeamSelector
 
 
 class QueryPlan(PlannerModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_soft_team_mentions(cls, value):
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        if "soft_team_mentions" not in migrated:
+            migrated["soft_team_mentions"] = []
+        return migrated
+
     semantic_query: str
     keyword_query: str
     intent: Literal[
@@ -317,7 +396,16 @@ class QueryPlan(PlannerModel):
     ]
     player_mentions: list[str]
     team_mentions: list[TeamCode] = Field(
-        description="Canonical codes for explicit or highly confident teams."
+        description=(
+            "Canonical codes only for teams explicitly mentioned or "
+            "unambiguously normalized from the question."
+        )
+    )
+    soft_team_mentions: list[TeamCode] = Field(
+        description=(
+            "Optional inferred team context that must never constrain lookup "
+            "or exclude evidence."
+        )
     )
     negative_focus: list[str]
     entity_selectors: list[EntitySelector]
@@ -373,7 +461,7 @@ def _scope_review_issues(plan: QueryPlan) -> tuple[str, ...]:
             continue
         has_team_scope = any(
             item.field in {"team", "conference", "division"}
-            for item in selector.filters
+            for item in selector.hard_filters
         )
         if not has_team_scope:
             issues.append(
@@ -498,7 +586,7 @@ class QueryPlanner:
                             "plan and return a complete plan. Potential issue:\n"
                             f"{issue_text}\n"
                             "If the team constrains the player group, place the "
-                            "team filter inside that player selector. If the "
+                            "hard team filter inside that player selector. If the "
                             "team and player group are independent subjects, "
                             "preserve them independently. Do not merge scopes "
                             "automatically."

@@ -9,6 +9,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from ..planning.resolver import ResolutionResult, ResolvedEntity
 from .store import SearchHit
 
 
-RERANK_PROMPT_VERSION = "1"
+RERANK_PROMPT_VERSION = "3"
 MAX_CANDIDATE_TEXT_CHARS = 1_600
 MAX_RERANK_CANDIDATES = 30
 
@@ -48,6 +49,20 @@ to establish change, intermediate for an update between those endpoints, and
 not_applicable when chronology is not important. Recency matters only when the
 question or plan makes it matter; newer but off-topic evidence must not outrank
 older direct evidence.
+
+Treat hard_filters and ordinary team_mentions as prompt-grounded constraints.
+Soft_filters and soft_team_mentions are optional inferred context only: they may
+help interpret a candidate but must never disqualify evidence, override grounded
+entities, or outweigh the candidate text.
+
+Classify condition_alignment only relative to an explicit condition, criterion,
+or yes/no proposition in the question. Use supports when the report indicates a
+subject satisfies it, refutes when it indicates the subject does not satisfy it,
+mixed when the report contains materially conflicting or unresolved evidence,
+and not_applicable when the question has no such condition or the report does
+not address it. A direct refutation can still have a direct evidence relationship.
+Do not weaken clear disqualifying evidence into generic uncertainty merely
+because future events could change the reported state.
 
 Set redundant_with to the ID of a stronger supplied candidate only when this
 report repeats materially the same evidence without adding useful information.
@@ -83,11 +98,19 @@ class EvidenceSufficiency(StrEnum):
     WEAK = "weak"
 
 
+class ConditionAlignment(StrEnum):
+    SUPPORTS = "supports"
+    REFUTES = "refutes"
+    MIXED = "mixed"
+    NOT_APPLICABLE = "not_applicable"
+
+
 class RerankJudgment(RerankModel):
     document_id: str
     relevance_score: int
     relationship: EvidenceRelationship
     temporal_role: TemporalRole
+    condition_alignment: ConditionAlignment
     redundant_with: str | None
     reason: str
 
@@ -132,6 +155,18 @@ _RELATIONSHIP_BONUS = {
     EvidenceRelationship.SUPPORTING_CONTEXT: 2,
     EvidenceRelationship.IRRELEVANT: -40,
 }
+
+
+def _published_sort_key(value: str) -> datetime:
+    """Normalize date-only and timestamp metadata for chronological ordering."""
+    normalized = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        parsed = datetime.fromisoformat(value[:10])
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class ReportReranker:
@@ -182,11 +217,23 @@ class ReportReranker:
                         latency_ms INTEGER NOT NULL,
                         evidence_sufficiency TEXT NOT NULL,
                         sufficiency_reason TEXT NOT NULL,
+                        judgments_json TEXT NOT NULL DEFAULT '[]',
                         error TEXT,
                         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                     );
                     """
                 )
+                event_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(rerank_events)"
+                    )
+                }
+                if "judgments_json" not in event_columns:
+                    connection.execute(
+                        "ALTER TABLE rerank_events ADD COLUMN "
+                        "judgments_json TEXT NOT NULL DEFAULT '[]'"
+                    )
                 yield connection
         finally:
             connection.close()
@@ -439,7 +486,11 @@ class ReportReranker:
                 return
             selected.append(hit)
 
-        if plan.evidence_strategy == "timeline" or plan.temporal_mode == "timeline":
+        is_timeline = (
+            plan.evidence_strategy == "timeline"
+            or plan.temporal_mode == "timeline"
+        )
+        if is_timeline:
             for role in (TemporalRole.BASELINE, TemporalRole.CURRENT):
                 add(
                     next(
@@ -475,10 +526,23 @@ class ReportReranker:
             add(hit)
 
         selected = selected[:limit]
+        if is_timeline:
+            selected.sort(
+                key=lambda hit: _published_sort_key(hit.document.published_at)
+            )
         final_ranks = {
             hit.document.id: rank
             for rank, hit in enumerate(selected, start=1)
         }
+        selected_ids = set(final_ranks)
+        display_order = [
+            *selected,
+            *(
+                hit
+                for hit in ranked
+                if hit.document.id not in selected_ids
+            ),
+        ]
         ranked_candidates = tuple(
             RankedCandidate(
                 hit=hit,
@@ -489,11 +553,20 @@ class ReportReranker:
                     judgments[hit.document.id], plan
                 ),
             )
-            for hit in ranked
+            for hit in display_order
         )
         return selected, ranked_candidates
 
     def _log_event(self, request_hash: str, result: RerankResult) -> None:
+        judgments = [
+            {
+                **item.judgment.model_dump(mode="json"),
+                "retrieval_rank": item.original_rank,
+                "final_rank": item.final_rank,
+                "adjusted_score": item.adjusted_score,
+            }
+            for item in result.ranked_candidates
+        ]
         with self._connect() as connection:
             connection.execute(
                 """
@@ -501,8 +574,9 @@ class ReportReranker:
                     request_hash, model, prompt_version, api_called, cache_hit,
                     candidate_count, output_count, ranking_changed, input_tokens,
                     cached_input_tokens, output_tokens, estimated_cost_usd,
-                    latency_ms, evidence_sufficiency, sufficiency_reason, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    latency_ms, evidence_sufficiency, sufficiency_reason,
+                    judgments_json, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_hash,
@@ -520,6 +594,7 @@ class ReportReranker:
                     result.latency_ms,
                     result.evidence_sufficiency,
                     result.sufficiency_reason,
+                    json.dumps(judgments, separators=(",", ":")),
                     result.error,
                 ),
             )
@@ -671,15 +746,21 @@ class ReportReranker:
                 SELECT model, api_called, cache_hit, candidate_count,
                        output_count, ranking_changed, input_tokens,
                        cached_input_tokens, output_tokens, estimated_cost_usd,
-                       latency_ms, evidence_sufficiency, error
+                       latency_ms, evidence_sufficiency, judgments_json, error
                 FROM rerank_events
                 """
             ).fetchall()
 
         sufficiency: dict[str, int] = {}
+        condition_alignment: dict[str, int] = {}
         for row in rows:
             label = row["evidence_sufficiency"]
             sufficiency[label] = sufficiency.get(label, 0) + 1
+            for judgment in json.loads(row["judgments_json"]):
+                alignment = judgment["condition_alignment"]
+                condition_alignment[alignment] = (
+                    condition_alignment.get(alignment, 0) + 1
+                )
         priced = [row for row in rows if row["estimated_cost_usd"] is not None]
         return {
             "executions": len(rows),
@@ -707,4 +788,5 @@ class ReportReranker:
                 else 0
             ),
             "sufficiency": dict(sorted(sufficiency.items())),
+            "condition_alignment": dict(sorted(condition_alignment.items())),
         }

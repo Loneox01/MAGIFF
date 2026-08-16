@@ -322,6 +322,7 @@ def _print_rerank(result: RerankResult, *, include_judgments: bool) -> None:
                 f"relevance {item.judgment.relevance_score}/100 | "
                 f"{item.judgment.relationship} | "
                 f"{item.judgment.temporal_role} | "
+                f"condition {item.judgment.condition_alignment} | "
                 f"{item.judgment.reason}"
             )
 

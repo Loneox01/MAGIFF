@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -16,6 +17,7 @@ from processing.normalization.team_codes import normalize_team_codes
 from rag.planning.planner import (
     ConferenceFilter,
     DivisionFilter,
+    FormationFilter,
     NumericFilter,
     PlayerResolutionBasis,
     PlayerSelector,
@@ -28,6 +30,7 @@ from rag.planning.planner import (
 )
 from rag.planning.resolver import (
     EntityResolver,
+    PLAYER_FIELD_SPECS,
     ResolutionResult,
     ResolutionValidationError,
     ResolvedEntity,
@@ -36,6 +39,7 @@ from rag.planning.resolver import (
     validate_resolution_bounds,
 )
 from rag.retrieval.reranker import (
+    ConditionAlignment,
     EvidenceRelationship,
     EvidenceSufficiency,
     ReportReranker,
@@ -82,6 +86,17 @@ Boilerplate that should not be indexed.
 
 
 class RagTests(unittest.TestCase):
+    def test_formation_schema_matches_normalized_depth_chart_side(self) -> None:
+        schema = FormationFilter.model_json_schema()
+
+        self.assertEqual(
+            PLAYER_FIELD_SPECS["formation"].column,
+            "position_group",
+        )
+        description = schema["properties"]["field"]["description"]
+        self.assertIn("Normalized depth-chart side", description)
+        self.assertIn("requires QueryPlan.season", description)
+
     def test_team_code_normalization(self) -> None:
         frame = pl.DataFrame(
             {
@@ -318,7 +333,7 @@ class RagTests(unittest.TestCase):
             )
             repaired_group = player_group.model_copy(
                 update={
-                    "filters": [
+                    "hard_filters": [
                         TeamCodeFilter(
                             field="team",
                             operator="eq",
@@ -725,6 +740,150 @@ class RagTests(unittest.TestCase):
             )
             self.assertFalse(routing.event.triggered)
             self.assertEqual(routing.event.signals, ())
+
+    def test_soft_filters_and_team_mentions_never_constrain_resolution(self) -> None:
+        class FakeRepository:
+            def __init__(self) -> None:
+                self.selector = None
+
+            def list_teams(self) -> list[dict]:
+                self.fail_if_called = True
+                return []
+
+            def resolve_player_selector(self, selector, *, season, week):
+                self.selector = selector
+                return (
+                    [
+                        {
+                            "player_id": "tua-id",
+                            "display_name": "Tua Tagovailoa",
+                            "position": "QB",
+                            "position_group": "QB",
+                            "player_status": {
+                                "latest_team": "ATL",
+                                "status": "ACT",
+                            },
+                        }
+                    ],
+                    [],
+                    False,
+                )
+
+        selector = PlayerSelector(
+            entity_type="player",
+            reference_text="Tua Tagovailoa",
+            names=["Tua Tagovailoa"],
+            identity_confidence=1.0,
+            resolution_basis=PlayerResolutionBasis.EXACT_NAME,
+            hard_filters=[],
+            soft_filters=[
+                TeamCodeFilter(field="team", operator="eq", values=["MIA"])
+            ],
+            semantic_qualifiers=["current status"],
+        )
+        plan = QueryPlan(
+            semantic_query="latest Tua Tagovailoa status",
+            keyword_query="Tua Tagovailoa latest",
+            intent="current_status",
+            player_mentions=["Tua Tagovailoa"],
+            team_mentions=[],
+            soft_team_mentions=["MIA"],
+            negative_focus=[],
+            entity_selectors=[selector],
+            season=None,
+            week=None,
+            temporal_mode="latest",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="single_document",
+        )
+        repository = FakeRepository()
+
+        resolution = EntityResolver(repository=repository).resolve(plan)
+
+        self.assertEqual(resolution.players[0].entity_id, "tua-id")
+        self.assertEqual(resolution.players[0].team, "ATL")
+        self.assertEqual(repository.selector.hard_filters, [])
+        self.assertEqual(repository.selector.soft_filters[0].values, ["MIA"])
+        self.assertEqual(resolution.teams, [])
+        self.assertEqual(
+            QueryPlanExecutor._resolved_team_filters(resolution),
+            [],
+        )
+
+    def test_literal_full_name_is_looked_up_with_model_candidate(self) -> None:
+        class FakeRepository:
+            def list_teams(self) -> list[dict]:
+                return [
+                    {
+                        "team_abbr": "BUF",
+                        "team_id": "BUF",
+                        "team_name": "Buffalo Bills",
+                        "team_nick": "Bills",
+                        "team_conf": "AFC",
+                        "team_division": "AFC East",
+                    }
+                ]
+
+            def resolve_player_selector(self, selector, *, season, week):
+                self.lookup_names = selector.names
+                self.hard_filters = selector.hard_filters
+                rows = []
+                if "DJ Moore" in selector.names:
+                    rows.append(
+                        {
+                            "player_id": "buffalo-wr-id",
+                            "display_name": "DJ Moore",
+                            "position": "WR",
+                            "position_group": "WR",
+                            "player_status": {
+                                "latest_team": "BUF",
+                                "status": "ACT",
+                            },
+                        }
+                    )
+                # The hard Buffalo relationship excludes the distinct former
+                # Carolina defensive back represented by the punctuated name.
+                return rows, [], False
+
+        selector = PlayerSelector(
+            entity_type="player",
+            reference_text="DJ Moore",
+            names=["D.J. Moore"],
+            identity_confidence=1.0,
+            resolution_basis=PlayerResolutionBasis.KNOWN_ALIAS,
+            hard_filters=[
+                TeamCodeFilter(field="team", operator="eq", values=["BUF"])
+            ],
+            soft_filters=[],
+            semantic_qualifiers=["receiving outlook"],
+        )
+        plan = QueryPlan(
+            semantic_query="DJ Moore Buffalo receiving outlook",
+            keyword_query="DJ Moore Buffalo",
+            intent="current_status",
+            player_mentions=["D.J. Moore"],
+            team_mentions=["BUF"],
+            soft_team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[selector],
+            season=2026,
+            week=None,
+            temporal_mode="current",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="single_document",
+        )
+        repository = FakeRepository()
+
+        resolution = EntityResolver(repository=repository).resolve(plan)
+
+        self.assertEqual(repository.lookup_names, ["DJ Moore", "D.J. Moore"])
+        self.assertEqual(repository.hard_filters[0].values, ["BUF"])
+        self.assertEqual(resolution.players[0].entity_id, "buffalo-wr-id")
+        self.assertEqual(resolution.players[0].display_name, "DJ Moore")
 
     def test_executor_links_ids_and_prioritizes_current_report(self) -> None:
         older_report = REPORT.replace(
@@ -1225,7 +1384,7 @@ class RagTests(unittest.TestCase):
                 return []
 
             def resolve_player_selector(self, selector, *, season, week):
-                if selector.names == ["DeMario Douglas"]:
+                if "DeMario Douglas" in selector.names:
                     return (
                         [
                             {
@@ -1238,7 +1397,7 @@ class RagTests(unittest.TestCase):
                         [],
                         False,
                     )
-                if selector.names == ["Douglas"]:
+                if "Douglas" in selector.names:
                     return (
                         [
                             {
@@ -1643,6 +1802,7 @@ class RagTests(unittest.TestCase):
                             relevance_score=25,
                             relationship=EvidenceRelationship.SUPPORTING_CONTEXT,
                             temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.MIXED,
                             redundant_with=None,
                             reason="New but does not report Alpha's status.",
                         ),
@@ -1651,6 +1811,7 @@ class RagTests(unittest.TestCase):
                             relevance_score=96,
                             relationship=EvidenceRelationship.DIRECT,
                             temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.SUPPORTS,
                             redundant_with=None,
                             reason="Directly states Alpha's practice clearance.",
                         ),
@@ -1685,6 +1846,23 @@ class RagTests(unittest.TestCase):
             self.assertEqual(first.input_tokens, 200)
             self.assertEqual(first.cached_input_tokens, 20)
             self.assertIsNone(first.error)
+            with sqlite3.connect(root / "index.sqlite3") as connection:
+                event_judgments = json.loads(
+                    connection.execute(
+                        "SELECT judgments_json FROM rerank_events ORDER BY id DESC"
+                    ).fetchone()[0]
+                )
+            alignment_by_id = {
+                item["document_id"]: item["condition_alignment"]
+                for item in event_judgments
+            }
+            self.assertEqual(
+                alignment_by_id,
+                {
+                    "direct-update": "supports",
+                    "newer-context": "mixed",
+                },
+            )
 
             client.responses.parse = lambda **_: self.fail(
                 "Cached reranking should avoid a second model call"
@@ -1704,6 +1882,10 @@ class RagTests(unittest.TestCase):
             self.assertEqual(stats["executions"], 2)
             self.assertEqual(stats["api_calls"], 1)
             self.assertEqual(stats["cache_hits"], 1)
+            self.assertEqual(
+                stats["condition_alignment"],
+                {"mixed": 2, "supports": 2},
+            )
 
     def test_reranker_rejects_invalid_ids_and_preserves_retrieval_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1736,6 +1918,7 @@ class RagTests(unittest.TestCase):
                             relevance_score=99,
                             relationship=EvidenceRelationship.DIRECT,
                             temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
                             redundant_with=None,
                             reason="Invalid candidate.",
                         )
@@ -1800,6 +1983,7 @@ class RagTests(unittest.TestCase):
                     relevance_score=99,
                     relationship=EvidenceRelationship.DIRECT,
                     temporal_role=TemporalRole.INTERMEDIATE,
+                    condition_alignment=ConditionAlignment.NOT_APPLICABLE,
                     redundant_with=None,
                     reason="Strong middle update.",
                 ),
@@ -1808,6 +1992,7 @@ class RagTests(unittest.TestCase):
                     relevance_score=80,
                     relationship=EvidenceRelationship.DIRECT,
                     temporal_role=TemporalRole.CURRENT,
+                    condition_alignment=ConditionAlignment.NOT_APPLICABLE,
                     redundant_with=None,
                     reason="Establishes the current state.",
                 ),
@@ -1816,6 +2001,7 @@ class RagTests(unittest.TestCase):
                     relevance_score=70,
                     relationship=EvidenceRelationship.DIRECT,
                     temporal_role=TemporalRole.BASELINE,
+                    condition_alignment=ConditionAlignment.NOT_APPLICABLE,
                     redundant_with=None,
                     reason="Establishes the earlier state.",
                 ),
@@ -1857,12 +2043,20 @@ class RagTests(unittest.TestCase):
                 plan,
                 ResolutionResult(selectors=[]),
                 hits,
-                limit=2,
+                limit=3,
             )
 
             self.assertEqual(
                 [hit.document.id for hit in result.hits],
-                ["baseline", "current"],
+                ["baseline", "intermediate", "current"],
+            )
+            self.assertEqual(
+                [
+                    item.final_rank
+                    for item in result.ranked_candidates
+                    if item.final_rank is not None
+                ],
+                [1, 2, 3],
             )
 
     def test_reranker_excludes_redundant_evidence_when_alternative_exists(self) -> None:
@@ -1891,6 +2085,7 @@ class RagTests(unittest.TestCase):
                             relevance_score=95,
                             relationship=EvidenceRelationship.DIRECT,
                             temporal_role=TemporalRole.NOT_APPLICABLE,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
                             redundant_with=None,
                             reason="Best direct report.",
                         ),
@@ -1899,6 +2094,7 @@ class RagTests(unittest.TestCase):
                             relevance_score=90,
                             relationship=EvidenceRelationship.DIRECT,
                             temporal_role=TemporalRole.NOT_APPLICABLE,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
                             redundant_with="primary",
                             reason="Repeats the primary report.",
                         ),
@@ -1907,6 +2103,7 @@ class RagTests(unittest.TestCase):
                             relevance_score=75,
                             relationship=EvidenceRelationship.SUPPORTING_CONTEXT,
                             temporal_role=TemporalRole.NOT_APPLICABLE,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
                             redundant_with=None,
                             reason="Adds separate workload evidence.",
                         ),

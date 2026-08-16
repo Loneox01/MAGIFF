@@ -141,6 +141,8 @@ class DepthChartPosition(StrEnum):
 
 
 class Formation(StrEnum):
+    """Normalized depth-chart side, not a personnel package or workload."""
+
     DEFENSE = "Defense"
     OFFENSE = "Offense"
     SPECIAL_TEAMS = "Special Teams"

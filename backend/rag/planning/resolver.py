@@ -75,8 +75,11 @@ PLAYER_FIELD_SPECS = {
     "depth_rank": FieldSpec(
         "current_depth_chart_entries", "depth_rank", "integer"
     ),
+    # The planner's finite Formation vocabulary represents the normalized
+    # offense/defense/special-teams side. The processed `formation` column is a
+    # source formation such as `3WR 1TE` or `Base 4-3 D` in newer snapshots.
     "formation": FieldSpec(
-        "current_depth_chart_entries", "formation", "text"
+        "current_depth_chart_entries", "position_group", "text"
     ),
     "ecr_rank": FieldSpec("player_ecr", "overall_rank", "number"),
     "ecr_position": FieldSpec("player_ecr", "position", "text"),
@@ -458,7 +461,9 @@ class SupabaseEntityRepository:
     ) -> tuple[list[dict], list[str], bool]:
         supported: list[EntityFilter] = []
         unresolved: list[str] = []
-        for item in selector.filters:
+        # Soft filters are retained on the selector for downstream context but
+        # intentionally never become database predicates.
+        for item in selector.hard_filters:
             spec = PLAYER_FIELD_SPECS.get(item.field)
             if spec is None:
                 unresolved.append(f"{item.field}: not valid for a player selector")
@@ -621,7 +626,7 @@ class EntityResolver:
                     named[str(team["team_abbr"])] = team
             candidates = named
 
-        for item in selector.filters:
+        for item in selector.hard_filters:
             column = TEAM_FILTER_FIELDS.get(item.field)
             if column is None:
                 unresolved_filters.append(
@@ -672,7 +677,7 @@ class EntityResolver:
         filters = []
         unresolved: list[str] = []
         team_scopes: list[set[str]] = []
-        for item in selector.filters:
+        for item in selector.hard_filters:
             if item.field in {"conference", "division"}:
                 teams = self.repository.list_teams()
                 column = TEAM_FILTER_FIELDS[item.field]
@@ -723,9 +728,27 @@ class EntityResolver:
             else:
                 unresolved.append("team: structured scopes do not overlap")
         normalized = PlayerSelector.model_validate(
-            {**selector.model_dump(), "filters": filters}
+            {**selector.model_dump(), "hard_filters": filters}
         )
         return normalized, unresolved
+
+    @staticmethod
+    def _identity_lookup_selector(selector: PlayerSelector) -> PlayerSelector:
+        """Try a literal full-name phrase alongside Luna's canonical guess.
+
+        This preserves meaningful spelling and punctuation distinctions such as
+        `DJ Moore` versus `D.J. Moore` without turning short nicknames like CMC
+        or K9 into broad database searches. The public selector remains limited
+        to one model candidate; the extra names exist only inside repository
+        lookup.
+        """
+        reference = selector.reference_text.strip()
+        if not selector.names or " " not in reference:
+            return selector
+        lookup_names = list(dict.fromkeys([reference, *selector.names]))
+        if lookup_names == selector.names:
+            return selector
+        return selector.model_copy(update={"names": lookup_names})
 
     @staticmethod
     def _selectors_with_mentions(plan: QueryPlan) -> list[EntitySelector]:
@@ -749,7 +772,8 @@ class EntityResolver:
                 names=[name],
                 identity_confidence=1.0,
                 resolution_basis=PlayerResolutionBasis.EXACT_NAME,
-                filters=[],
+                hard_filters=[],
+                soft_filters=[],
                 semantic_qualifiers=[],
             )
             for name in plan.player_mentions
@@ -759,7 +783,8 @@ class EntityResolver:
             TeamSelector(
                 entity_type="team",
                 names=[name],
-                filters=[],
+                hard_filters=[],
+                soft_filters=[],
                 semantic_qualifiers=[],
             )
             for name in plan.team_mentions
@@ -795,7 +820,7 @@ class EntityResolver:
             else:
                 rows, unresolved, truncated = (
                     self.repository.resolve_player_selector(
-                        normalized,
+                        self._identity_lookup_selector(normalized),
                         season=plan.season,
                         week=plan.week,
                     )

@@ -59,7 +59,9 @@ class QueryPlanExecutor:
     def _resolved_team_filters(resolution: ResolutionResult) -> list[str]:
         teams = [team.entity_id for team in resolution.teams]
         for selector_result in resolution.selectors:
-            for item in selector_result.selector.filters:
+            # Only prompt-grounded hard filters may constrain report lookup.
+            # Soft filters remain in the plan for diagnostics/reranking.
+            for item in selector_result.selector.hard_filters:
                 if item.field == "team":
                     teams.extend(item.values)
         return list(dict.fromkeys(teams))

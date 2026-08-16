@@ -87,14 +87,19 @@ sends the question, finalized plan, resolved entities, and compact candidate
 records to one structured-output model call, then returns the requested
 `--limit`. Use `--rerank-candidates`, `--rerank-model`, and `--refresh-rerank`
 to override those defaults. The model judges relevance, evidence relationship,
-temporal role, and overall evidence sufficiency. Code—not the model—validates
-document IDs and composes final results so timelines retain endpoints and
-per-entity searches retain subject coverage. Invalid responses or API failures
+temporal role, explicit condition alignment (`supports`, `refutes`, `mixed`, or
+`not_applicable`), and overall evidence sufficiency. Condition alignment is
+currently exposed and logged for calibration but does not alter ranking scores.
+Code—not the model—validates
+document IDs and composes final results so timelines retain endpoints and order
+the selected evidence chronologically, while per-entity searches retain subject
+coverage. Invalid responses or API failures
 fall back to the original retrieval order.
 
 Reranker responses are cached by the complete question/plan/entity/candidate
 payload, model, and prompt version. `python -m rag.cli status` reports cache use,
-tokens, latency, rank changes, errors, and evidence-sufficiency counts. Token
+tokens, latency, rank changes, errors, evidence-sufficiency counts, and condition
+alignment counts. Token
 counts are always recorded. Dollar estimates appear only when current rates are
 configured with `OPENAI_RERANK_INPUT_COST_PER_MILLION`,
 `OPENAI_RERANK_CACHED_INPUT_COST_PER_MILLION`, and
@@ -104,6 +109,13 @@ The planner also caches identical questions for the current date. It returns
 separate keyword and semantic queries plus typed entity selectors. A read-only
 resolver maps those selectors to canonical Supabase player/team records through
 an allowlist of verified columns; planner output never becomes arbitrary SQL.
+
+Each selector separates `hard_filters` from `soft_filters`. Hard filters must be
+explicitly stated or unambiguously normalized/entailed by the question and are
+the only planner filters allowed to constrain Supabase or report lookup. Soft
+filters and `soft_team_mentions` preserve optional inferred context for
+diagnostics and reranking but can never exclude an entity or document. Ordinary
+`team_mentions` are reserved for teams actually supplied by the question.
 
 Finite database vocabularies live in `planning/schema_values.py`. The generated planner
 schema enumerates canonical team codes, player/depth-chart positions, position
@@ -120,6 +132,9 @@ For every single-player reference, the planner preserves the exact phrase and
 returns its best official full-name candidate, a 0–1 identity confidence, and an
 enumerated resolution basis: `exact_name`, `known_alias`, `contextual_alias`, or
 `inferred`. Player groups use `not_applicable`, zero confidence, and no name.
+When the literal reference resembles a full name, resolution searches it
+alongside Luna's canonical candidate. This preserves database-significant
+spelling and punctuation distinctions without broadening short nickname lookups.
 
 The router combines those signals with database resolution. Exact names must
 agree with the uniquely matched official name; known aliases currently require

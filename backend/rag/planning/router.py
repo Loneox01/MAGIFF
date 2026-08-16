@@ -27,7 +27,7 @@ from .planner import PlayerResolutionBasis, PlayerSelector, QueryPlan
 from .resolver import EntityResolver, ResolutionResult
 
 
-ESCALATION_PROMPT_VERSION = "4"
+ESCALATION_PROMPT_VERSION = "5"
 MAX_ESCALATION_DATABASE_CANDIDATES = 8
 
 MIN_CONFIDENCE_BY_BASIS = {
@@ -573,9 +573,16 @@ class EscalationRouter:
                         "team_mentions": [
                             str(team) for team in plan.team_mentions
                         ],
-                        "filters": [
+                        "soft_team_mentions": [
+                            str(team) for team in plan.soft_team_mentions
+                        ],
+                        "hard_filters": [
                             item.model_dump(mode="json")
-                            for item in selector.filters
+                            for item in selector.hard_filters
+                        ],
+                        "soft_filters": [
+                            item.model_dump(mode="json")
+                            for item in selector.soft_filters
                         ],
                         "semantic_qualifiers": list(
                             selector.semantic_qualifiers
