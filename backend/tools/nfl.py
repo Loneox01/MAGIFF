@@ -1,5 +1,7 @@
 """Model-facing NFL tools backed by the selected data repository."""
 
+from datetime import date
+
 from repositories import nfl_supabase as repository
 from tools.field_catalog import (
     PLAYER_FORMULA_FIELDS,
@@ -60,6 +62,21 @@ DEFAULT_TEAM_FIELDS = [
     "receiving_yards",
     "receiving_tds",
 ]
+ECR_REDRAFT_ROSTER_CONTEXT = {
+    "source_roster_assumption": "3 starting WR slots",
+    "interpretation_note": (
+        "FantasyPros redraft ECR can value WRs more highly than a two-WR league "
+        "and push other positions slightly lower."
+    ),
+}
+
+
+def _ecr_roster_context(league_format: str) -> dict[str, str]:
+    if league_format in {"redraft_1qb", "redraft_superflex"}:
+        return ECR_REDRAFT_ROSTER_CONTEXT
+    return {}
+
+
 def _stat_fields(fields: list[str] | None) -> list[str]:
     selected = DEFAULT_STAT_FIELDS if fields is None else list(dict.fromkeys(fields))
     invalid = set(selected) - ALLOWED_STAT_FIELDS
@@ -92,6 +109,11 @@ def _season_type(season_type: str | None) -> str:
     if value not in {"REG", "POST"}:
         raise ValueError("season_type must be REG, POST, or null")
     return value
+
+
+def _current_nfl_season(current_date: date | None = None) -> int:
+    reference = current_date or date.today()
+    return reference.year if reference.month >= 3 else reference.year - 1
 
 
 def find_players(name: str) -> list[dict]:
@@ -173,13 +195,56 @@ def get_team_roster(
     week: int | None = None,
     position: str | None = None,
     status: str | None = None,
-) -> list[dict]:
-    """Return a weekly roster, defaulting to the latest available week."""
+    *,
+    current_date: date | None = None,
+) -> dict:
+    """Return a weekly roster or a labeled current player-status fallback."""
+    team_code = _team_code(team)
     position_code = position.strip().upper() if position else None
     status_code = status.strip().upper() if status else None
-    return repository.get_team_roster(
-        _team_code(team), season, week, position_code, status_code
+    rows = repository.get_team_roster(
+        team_code, season, week, position_code, status_code
     )
+    if rows:
+        return {
+            "results": rows,
+            "source_snapshot": "weekly_roster",
+            "season": season,
+            "week": rows[0].get("week"),
+            "fallback_used": False,
+            "fallback_reason": None,
+        }
+
+    if season == _current_nfl_season(current_date):
+        current_rows = repository.get_current_team_roster(
+            team_code,
+            season,
+            position_code,
+            status_code,
+        )
+        if current_rows:
+            return {
+                "results": current_rows,
+                "source_snapshot": "current_player_status",
+                "season": season,
+                "week": None,
+                "fallback_used": True,
+                "fallback_reason": (
+                    "No current-season weekly roster rows were available; "
+                    "used player_status rows whose last_season matches the "
+                    "requested season. This may represent a preseason-sized "
+                    "roster rather than a finalized weekly active roster."
+                ),
+            }
+
+    return {
+        "results": [],
+        "source_snapshot": "weekly_roster",
+        "season": season,
+        "week": week,
+        "fallback_used": False,
+        "fallback_reason": None,
+    }
 
 
 def rank_players_by_formula(
@@ -596,6 +661,7 @@ def rank_players_by_ecr(
         "scoring_format": scoring_format,
         "league_format": league_format,
         "snapshot_type": snapshot_type,
+        **_ecr_roster_context(league_format),
         "positions": selected_positions,
         "sort_by": sort_by,
         "sort_direction": sort_direction,
@@ -719,6 +785,7 @@ def compare_ecr_to_results(
         "scoring_format": scoring_format,
         "league_format": league_format,
         "snapshot_type": snapshot_type,
+        **_ecr_roster_context(league_format),
         "positions": selected_positions,
         "comparison_basis": comparison_basis,
         "sort_by": sort_by,

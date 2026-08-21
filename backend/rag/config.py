@@ -20,6 +20,10 @@ DEFAULT_PLANNER_MODEL = os.getenv(
     "OPENAI_PLANNER_MODEL",
     "gpt-5.6-luna",
 )
+DEFAULT_CONTEXT_PLANNER_MODEL = os.getenv(
+    "OPENAI_CONTEXT_PLANNER_MODEL",
+    "gpt-5.6-terra",
+)
 DEFAULT_ESCALATION_MODEL = os.getenv(
     "OPENAI_ESCALATION_MODEL",
     "gpt-5.6-sol",
@@ -28,7 +32,9 @@ DEFAULT_RERANK_MODEL = os.getenv(
     "OPENAI_RERANK_MODEL",
     DEFAULT_PLANNER_MODEL,
 )
-DEFAULT_RERANK_CANDIDATES = int(os.getenv("RAG_RERANK_CANDIDATES", "15"))
+# Retrieve more broadly for the inexpensive batched reranker while the
+# model-facing report tool continues to return at most five selected reports.
+DEFAULT_RERANK_CANDIDATES = int(os.getenv("RAG_RERANK_CANDIDATES", "20"))
 
 # Defaults reflect the model price when this router was introduced. Environment
 # overrides keep cost telemetry useful if pricing or the escalation model changes.

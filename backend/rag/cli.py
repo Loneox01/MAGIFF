@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from .config import (
+    DEFAULT_CONTEXT_PLANNER_MODEL,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_ESCALATION_MODEL,
     DEFAULT_INDEX_PATH,
@@ -10,9 +11,11 @@ from .config import (
     DEFAULT_RERANK_CANDIDATES,
     DEFAULT_RERANK_MODEL,
 )
+from .planning.context_planner import ContextPlanResult, ContextPlanner
 from .documents import load_reports
 from .evaluation import CASES, evaluate_retrieval
 from .planning.planner import QueryPlanResult, QueryPlanner
+from .planning.enrichment import StructuredLookupExecutor
 from .planning.resolver import (
     EntityResolver,
     ResolutionResult,
@@ -51,7 +54,7 @@ def _add_planner_options(
         parser.add_argument(
             "--use-planner",
             action="store_true",
-            help="Generate separate semantic and keyword queries before retrieval",
+            help="Run staged direct and contextual planning before retrieval",
         )
         parser.add_argument(
             "--show-plan",
@@ -63,11 +66,30 @@ def _add_planner_options(
             action="store_true",
             help="Print database-resolved players, teams, and unresolved constraints",
         )
-    parser.add_argument("--planner-model", default=DEFAULT_PLANNER_MODEL)
+    parser.add_argument(
+        "--planner-model",
+        default=DEFAULT_PLANNER_MODEL,
+        help="Model used for direct target and constraint planning",
+    )
     parser.add_argument(
         "--refresh-plan",
         action="store_true",
         help="Ignore a cached plan and call the planner again",
+    )
+    parser.add_argument(
+        "--context-model",
+        default=DEFAULT_CONTEXT_PLANNER_MODEL,
+        help="Model used only for indirect contextual evidence planning",
+    )
+    parser.add_argument(
+        "--refresh-context",
+        action="store_true",
+        help="Ignore a cached contextual plan and call its planner again",
+    )
+    parser.add_argument(
+        "--no-context-planner",
+        action="store_true",
+        help="Run only direct report planning (useful for isolated tests)",
     )
     parser.add_argument(
         "--no-escalation",
@@ -185,9 +207,17 @@ def _print_hit(index: int, hit: SearchHit) -> None:
     if hit.vector_rank is not None:
         ranks.append(f"vector #{hit.vector_rank}")
     rank_text = f"; {', '.join(ranks)}" if ranks else ""
+    scope_text = (
+        f"; scopes {', '.join(hit.retrieval_scopes)}"
+        if hit.retrieval_scopes
+        else ""
+    )
 
     print(f"\n{index}. {document.title}")
-    print(f"   {document.source} | {document.published_at} | {hit.method} {hit.score:.4f}{rank_text}")
+    print(
+        f"   {document.source} | {document.published_at} | "
+        f"{hit.method} {hit.score:.4f}{rank_text}{scope_text}"
+    )
     print(f"   Players: {', '.join(document.players)}")
     print(f"   {document.url}")
     snippet = document.snippet
@@ -196,20 +226,41 @@ def _print_hit(index: int, hit: SearchHit) -> None:
 
 def _print_plan(result: QueryPlanResult, *, include_json: bool) -> None:
     cache_status = "cache hit" if result.cached else "cache miss"
-    scope_status = (
-        f" | scope repair attempts {result.scope_retries}"
-        if result.scope_retries
-        else ""
-    )
     print(
         f"Planner: {result.model} | {cache_status} | "
-        f"input tokens {result.input_tokens} | output tokens {result.output_tokens}"
-        f"{scope_status}"
+        f"input tokens {result.input_tokens} "
+        f"({result.cached_input_tokens} cached) | "
+        f"output tokens {result.output_tokens} | "
+        f"attempts {result.attempts} | "
+        f"correction retry {'yes' if result.retried else 'no'}"
     )
-    for issue in result.scope_issues:
-        print(f"  Scope review remains: {issue}")
+    if result.retry_reason:
+        print(f"  Correction reason: {result.retry_reason.splitlines()[0]}")
     if include_json:
         print(result.plan.model_dump_json(indent=2))
+
+
+def _print_context_plan(
+    result: ContextPlanResult,
+    *,
+    include_json: bool,
+) -> None:
+    cache_status = "cache hit" if result.cached else "cache miss"
+    print(
+        f"Context planner: {result.model} | {cache_status} | "
+        f"needed {'yes' if result.context_plan.context_needed else 'no'} | "
+        f"branches {len(result.context_plan.context_requests)} | "
+        f"attempts {result.attempts} | "
+        f"correction retry {'yes' if result.retried else 'no'} | "
+        f"input tokens {result.input_tokens} "
+        f"({result.cached_input_tokens} cached) | "
+        f"output tokens {result.output_tokens}"
+    )
+    print(f"  Reason: {result.context_plan.rationale}")
+    if result.retry_reason:
+        print(f"  Correction reason: {result.retry_reason.splitlines()[0]}")
+    if include_json:
+        print(result.context_plan.model_dump_json(indent=2))
 
 
 def _print_resolution(result: ResolutionResult) -> None:
@@ -262,8 +313,12 @@ def _print_escalation(event: EscalationEvent) -> None:
             f"confidence {signal.identity_confidence:.2f} | "
             f"database {signal.database_status} | {reasons}"
         )
-        if len(signal.database_matches) > 1:
-            print(f"    Database candidates: {database_matches}")
+        if signal.database_matches and (
+            len(signal.database_matches) > 1
+            or signal.database_match_method != "direct"
+        ):
+            method = signal.database_match_method.replace("_", " ")
+            print(f"    Database candidates ({method}): {database_matches}")
         elif signal.database_matches_omitted:
             print(
                 "    Database candidates omitted: "
@@ -407,8 +462,32 @@ def main() -> None:
                     resolution = routing.resolution
                     _print_escalation(routing.event)
                     if args.show_plan and routing.event.plan_changed:
-                        print("Final plan:")
+                        print("Identity-adjusted direct plan:")
                         print(active_plan.model_dump_json(indent=2))
+                if not args.no_context_planner:
+                    context_result = ContextPlanner(
+                        index_path=args.index_path,
+                        model=args.context_model,
+                    ).expand(
+                        args.query,
+                        active_plan,
+                        resolution,
+                        use_cache=not args.refresh_context,
+                    )
+                    active_plan = context_result.plan
+                    resolution = resolver.resolve(active_plan)
+                    validate_resolution_bounds(resolution)
+                    _print_context_plan(
+                        context_result,
+                        include_json=args.show_plan,
+                    )
+                    if args.show_plan:
+                        print("Combined execution plan:")
+                        print(active_plan.model_dump_json(indent=2))
+                enrichment = StructuredLookupExecutor().execute(
+                    active_plan,
+                    resolution,
+                )
                 execution = QueryPlanExecutor(store).execute(
                     args.query,
                     active_plan,
@@ -419,14 +498,40 @@ def main() -> None:
                     ),
                     embedding_model=args.embedding_model,
                     manual_filters=filters,
+                    enrichment=enrichment,
                 )
                 hits = execution.hits
                 if args.show_resolution:
                     _print_resolution(resolution)
+                    lookup_count = sum(
+                        len(group.lookups)
+                        for group in [
+                            *enrichment.targets,
+                            *enrichment.contexts,
+                        ]
+                    )
                     print(
                         f"Executor: {execution.strategy} | "
-                        f"new document-player links {execution.linked_document_entities}"
+                        f"branches {execution.branch_candidates} | "
+                        f"lookups {lookup_count} | "
+                        "new document-player links "
+                        f"{execution.linked_document_entities}"
                     )
+                    for group in [*enrichment.targets, *enrichment.contexts]:
+                        for lookup in group.lookups:
+                            print(
+                                "  Structured lookup: "
+                                f"{lookup.lookup_id} | {lookup.operation} | "
+                                f"{lookup.purpose} | {lookup.status} | "
+                                f"entities {len(lookup.entities)}"
+                            )
+                            if lookup.fallback_used:
+                                print(
+                                    "    Fallback: "
+                                    f"{lookup.fallback_reason}"
+                                )
+                            if lookup.error:
+                                print(f"    Error: {lookup.error}")
                 if args.rerank:
                     rerank_result = ReportReranker(
                         index_path=args.index_path,
@@ -438,6 +543,7 @@ def main() -> None:
                         hits,
                         limit=args.limit,
                         use_cache=not args.refresh_rerank,
+                        enrichment=enrichment,
                     )
                     hits = rerank_result.hits
                     _print_rerank(
@@ -470,24 +576,40 @@ def main() -> None:
                 use_cache=not args.refresh_plan,
             )
             _print_plan(result, include_json=True)
+            resolver = EntityResolver()
+            active_plan = result.plan
+            resolution = resolver.resolve(active_plan)
+            validate_resolution_bounds(resolution)
             if not args.no_escalation:
-                resolver = EntityResolver()
-                resolution = resolver.resolve(result.plan)
-                validate_resolution_bounds(resolution)
                 routing = EscalationRouter(
                     index_path=args.index_path,
                     model=args.escalation_model,
                 ).route(
                     args.query,
-                    result.plan,
+                    active_plan,
                     resolution,
                     resolver=resolver,
                     use_cache=not args.refresh_escalation,
                 )
+                active_plan = routing.plan
+                resolution = routing.resolution
                 _print_escalation(routing.event)
                 if routing.event.plan_changed:
-                    print("Final plan:")
-                    print(routing.plan.model_dump_json(indent=2))
+                    print("Identity-adjusted direct plan:")
+                    print(active_plan.model_dump_json(indent=2))
+            if not args.no_context_planner:
+                context_result = ContextPlanner(
+                    index_path=args.index_path,
+                    model=args.context_model,
+                ).expand(
+                    args.query,
+                    active_plan,
+                    resolution,
+                    use_cache=not args.refresh_context,
+                )
+                _print_context_plan(context_result, include_json=True)
+                print("Combined execution plan:")
+                print(context_result.plan.model_dump_json(indent=2))
 
         elif args.command == "evaluate":
             passes, results = evaluate_retrieval(

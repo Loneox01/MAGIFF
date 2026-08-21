@@ -8,11 +8,13 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from database.client import get_supabase_client
 
+from .lookups import ContextScopePolicy, TEAM_ANCHORED_LOOKUP_OPERATIONS
 from .planner import (
+    ContextRequest,
     EntityFilter,
     EntityFilterField,
     EntitySelector,
@@ -34,6 +36,27 @@ FRANCHISE_RELOCATIONS = {
     "SD": ("LAC", 2017),
     "STL": ("LA", 2016),
 }
+
+OPTIONAL_PLAYER_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
+def _player_name_tokens(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", value.casefold())
+
+
+def _without_optional_player_suffix(value: str) -> str | None:
+    """Return a lookup name only when the final token is a known suffix."""
+    tokens = _player_name_tokens(value)
+    if len(tokens) < 2 or tokens[-1] not in OPTIONAL_PLAYER_NAME_SUFFIXES:
+        return None
+    return " ".join(tokens[:-1])
+
+
+def _suffix_insensitive_player_name(value: str) -> str:
+    tokens = _player_name_tokens(value)
+    if tokens and tokens[-1] in OPTIONAL_PLAYER_NAME_SUFFIXES:
+        tokens = tokens[:-1]
+    return "".join(tokens)
 
 
 class ResolutionValidationError(RuntimeError):
@@ -148,8 +171,19 @@ class SelectorResolution(BaseModel):
     truncated: bool
 
 
+class ContextResolution(BaseModel):
+    request_index: int
+    request: ContextRequest
+    status: Literal["resolved", "unresolved"]
+    anchor_entities: list[ResolvedEntity]
+    teams: list[str]
+    unresolved: list[str]
+    truncated: bool
+
+
 class ResolutionResult(BaseModel):
     selectors: list[SelectorResolution]
+    contexts: list[ContextResolution] = Field(default_factory=list)
 
     @property
     def players(self) -> list[ResolvedEntity]:
@@ -179,8 +213,18 @@ def validate_resolution_bounds(result: ResolutionResult) -> None:
         and not selector_result.selector.names
         and selector_result.truncated
     ]
-    if not truncated_groups:
+    truncated_contexts = [
+        context.request_index for context in result.contexts if context.truncated
+    ]
+    if not truncated_groups and not truncated_contexts:
         return
+
+    if truncated_contexts:
+        raise ResolutionValidationError(
+            "unbounded_context_group",
+            "Contextual player expansion exceeded the safe resolution limit for "
+            f"request(s) {truncated_contexts}.",
+        )
 
     references = ", ".join(repr(value) for value in truncated_groups)
     raise ResolutionValidationError(
@@ -207,6 +251,14 @@ class EntityRepository(Protocol):
         season: int | None,
         week: int | None,
     ) -> tuple[list[dict], list[str], bool]: ...
+
+    def resolve_player_teams(
+        self,
+        player_ids: list[str],
+        *,
+        season: int,
+        week: int | None,
+    ) -> dict[str, str]: ...
 
 
 def _coerce_value(value: str, value_type: str) -> str | int | float:
@@ -533,6 +585,33 @@ class SupabaseEntityRepository:
         truncated = len(rows) > MAX_RESOLVED_ENTITIES
         return rows[:MAX_RESOLVED_ENTITIES], unresolved, truncated
 
+    def resolve_player_teams(
+        self,
+        player_ids: list[str],
+        *,
+        season: int,
+        week: int | None,
+    ) -> dict[str, str]:
+        """Resolve season-appropriate team membership for contextual anchors."""
+        if not player_ids:
+            return {}
+        query = (
+            self.client.table("player_weekly_rosters")
+            .select("player_id,team,week")
+            .eq("season", season)
+            .in_("player_id", player_ids)
+        )
+        if week is not None:
+            query = query.eq("week", week)
+        rows = query.order("week", desc=True).limit(1000).execute().data
+        teams: dict[str, str] = {}
+        for row in rows:
+            player_id = row.get("player_id")
+            team = row.get("team")
+            if player_id and team and player_id not in teams:
+                teams[str(player_id)] = str(team)
+        return teams
+
 
 def _normalize_team_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
@@ -541,6 +620,59 @@ def _normalize_team_text(value: str) -> str:
 class EntityResolver:
     def __init__(self, repository: EntityRepository | None = None) -> None:
         self.repository = repository or SupabaseEntityRepository()
+
+    @staticmethod
+    def _player_entity(row: dict) -> ResolvedEntity:
+        status = row.get("player_status") or {}
+        if isinstance(status, list):
+            status = status[0] if status else {}
+        return ResolvedEntity(
+            entity_type="player",
+            entity_id=str(row["player_id"]),
+            display_name=str(row["display_name"]),
+            team=status.get("latest_team"),
+            position=row.get("position"),
+            position_group=row.get("position_group"),
+            jersey_number=status.get("jersey_number"),
+            roster_status=status.get("status"),
+            rookie_season=row.get("rookie_season"),
+            draft_year=row.get("draft_year"),
+        )
+
+    def suffix_variant_candidates(
+        self,
+        selector: PlayerSelector,
+        *,
+        season: int | None,
+        week: int | None,
+    ) -> list[ResolvedEntity]:
+        """Propose DB candidates for Sol without silently grounding a suffix miss.
+
+        The normal resolver remains exact-first. This fallback is deliberately
+        narrow: it runs only for one model-proposed name ending in a recognized
+        generational suffix, preserves all selector filters, and retains only
+        rows whose full names are equal after optional-suffix normalization.
+        """
+        if len(selector.names) != 1:
+            return []
+        candidate_name = selector.names[0]
+        lookup_name = _without_optional_player_suffix(candidate_name)
+        if lookup_name is None:
+            return []
+
+        lookup_selector = selector.model_copy(update={"names": [lookup_name]})
+        rows, _, _ = self.repository.resolve_player_selector(
+            lookup_selector,
+            season=season,
+            week=week,
+        )
+        expected = _suffix_insensitive_player_name(candidate_name)
+        return _unique_entities(
+            self._player_entity(row)
+            for row in rows
+            if _suffix_insensitive_player_name(str(row.get("display_name", "")))
+            == expected
+        )
 
     def _team_aliases(self) -> tuple[list[dict], dict[str, list[dict]]]:
         teams = self.repository.list_teams()
@@ -792,6 +924,170 @@ class EntityResolver:
         )
         return selectors
 
+    def resolve_contexts(
+        self,
+        plan: QueryPlan,
+        selector_results: list[SelectorResolution],
+    ) -> list[ContextResolution]:
+        by_index = {item.selector_index: item for item in selector_results}
+        contexts: list[ContextResolution] = []
+        for request_index, request in enumerate(plan.context_requests):
+            anchor_result = by_index.get(request.anchor_selector_index)
+            anchors = list(anchor_result.matches) if anchor_result is not None else []
+            unresolved: list[str] = []
+            anchor_type = (
+                anchor_result.selector.entity_type
+                if anchor_result is not None
+                else None
+            )
+            if anchor_type == "player":
+                anchors = [
+                    anchor for anchor in anchors if anchor.entity_type == "player"
+                ]
+                is_specific_player = bool(anchor_result.selector.names)
+                if is_specific_player and len(anchors) != 1:
+                    unresolved.append(
+                        "specific-player context anchor must resolve to exactly "
+                        "one player"
+                    )
+                    anchors = []
+                elif not is_specific_player and not anchors:
+                    unresolved.append(
+                        "player-group context anchor must resolve to at least "
+                        "one player"
+                    )
+            elif anchor_type == "team":
+                anchors = [
+                    anchor for anchor in anchors if anchor.entity_type == "team"
+                ]
+                if not anchors:
+                    unresolved.append(
+                        "context anchor must resolve to at least one team"
+                    )
+            elif anchor_type is None:
+                unresolved.append("context anchor selector could not be resolved")
+
+            requires_anchor_teams = (
+                request.scope_policy
+                in {
+                    ContextScopePolicy.ANCHOR_TEAMS,
+                    ContextScopePolicy.ANCHOR_AND_LOOKUP_TEAMS,
+                }
+                or any(
+                    lookup.operation in TEAM_ANCHORED_LOOKUP_OPERATIONS
+                    for lookup in request.structured_lookups
+                )
+            )
+
+            teams: list[str] = []
+            if anchor_type == "team":
+                teams.extend(anchor.entity_id for anchor in anchors)
+            elif anchors and requires_anchor_teams:
+                explicit_teams = [
+                    str(value)
+                    for item in anchor_result.selector.hard_filters
+                    if item.field == "team"
+                    for value in item.values
+                ]
+                if explicit_teams:
+                    teams.extend(explicit_teams)
+                elif (
+                    plan.season is not None
+                    and plan.season < date.today().year
+                ):
+                    player_ids = [anchor.entity_id for anchor in anchors]
+                    seasonal = self.repository.resolve_player_teams(
+                        player_ids,
+                        season=plan.season,
+                        week=plan.week,
+                    )
+                    unresolved_players = []
+                    for anchor in anchors:
+                        seasonal_team = seasonal.get(anchor.entity_id)
+                        if seasonal_team:
+                            teams.append(seasonal_team)
+                        else:
+                            unresolved_players.append(anchor.display_name)
+                    if unresolved_players:
+                        unresolved.append(
+                            "context anchor team membership is incomplete for "
+                            "the requested season"
+                        )
+                else:
+                    teams.extend(anchor.team for anchor in anchors if anchor.team)
+                    missing_anchors = [anchor for anchor in anchors if not anchor.team]
+                    seasonal_missing: dict[str, str] = {}
+                    if missing_anchors and plan.season is not None:
+                        seasonal_missing = self.repository.resolve_player_teams(
+                            [anchor.entity_id for anchor in missing_anchors],
+                            season=plan.season,
+                            week=plan.week,
+                        )
+                        for anchor in missing_anchors:
+                            seasonal_team = seasonal_missing.get(anchor.entity_id)
+                            if seasonal_team:
+                                teams.append(seasonal_team)
+                    unresolved_players = [
+                        anchor.display_name
+                        for anchor in missing_anchors
+                        if not seasonal_missing.get(anchor.entity_id)
+                    ]
+                    if unresolved_players:
+                        unresolved.append(
+                            "context anchor current team membership is incomplete"
+                        )
+
+            canonical_teams: list[str] = []
+            if teams:
+                canonical_teams, missing = self._resolve_team_values(
+                    teams,
+                    season=plan.season,
+                )
+                unresolved.extend(
+                    f"context team could not resolve {team!r}" for team in missing
+                )
+
+            anchor_resolved = bool(anchors)
+            if request.scope_policy in {
+                ContextScopePolicy.ANCHOR_TEAMS,
+                ContextScopePolicy.ANCHOR_AND_LOOKUP_TEAMS,
+            }:
+                scope_resolved = bool(canonical_teams)
+            elif request.scope_policy == ContextScopePolicy.LOOKUP_ENTITIES:
+                # The structured-enrichment phase validates whether the
+                # requested operation actually returns bounded entities.
+                scope_resolved = bool(request.structured_lookups)
+                if not scope_resolved:
+                    unresolved.append(
+                        "lookup_entities scope requires a structured lookup"
+                    )
+            else:
+                # A semantic-only context branch deliberately has no metadata
+                # boundary beyond its resolved anchor and query provenance.
+                scope_resolved = True
+
+            status = (
+                "resolved"
+                if anchor_resolved and scope_resolved and not unresolved
+                else "unresolved"
+            )
+            contexts.append(
+                ContextResolution(
+                    request_index=request_index,
+                    request=request,
+                    status=status,
+                    anchor_entities=anchors,
+                    teams=canonical_teams,
+                    unresolved=unresolved,
+                    truncated=(
+                        anchor_result.truncated
+                        if anchor_result is not None
+                        else False
+                    ),
+                )
+            )
+        return contexts
+
     def resolve(self, plan: QueryPlan) -> ResolutionResult:
         results: list[SelectorResolution] = []
         for index, selector in enumerate(self._selectors_with_mentions(plan)):
@@ -828,25 +1124,7 @@ class EntityResolver:
             resolution_errors = [*team_errors, *unresolved]
             if resolution_errors and not normalized.names:
                 rows = []
-            matches = []
-            for row in rows:
-                status = row.get("player_status") or {}
-                if isinstance(status, list):
-                    status = status[0] if status else {}
-                matches.append(
-                    ResolvedEntity(
-                        entity_type="player",
-                        entity_id=str(row["player_id"]),
-                        display_name=str(row["display_name"]),
-                        team=status.get("latest_team"),
-                        position=row.get("position"),
-                        position_group=row.get("position_group"),
-                        jersey_number=status.get("jersey_number"),
-                        roster_status=status.get("status"),
-                        rookie_season=row.get("rookie_season"),
-                        draft_year=row.get("draft_year"),
-                    )
-                )
+            matches = [self._player_entity(row) for row in rows]
             results.append(
                 SelectorResolution(
                     selector_index=index,
@@ -858,7 +1136,10 @@ class EntityResolver:
                     truncated=truncated,
                 )
             )
-        return ResolutionResult(selectors=results)
+        return ResolutionResult(
+            selectors=results,
+            contexts=self.resolve_contexts(plan, results),
+        )
 
 
 def _resolution_status(

@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -16,6 +17,7 @@ import polars as pl
 from processing.normalization.team_codes import normalize_team_codes
 from rag.planning.planner import (
     ConferenceFilter,
+    ContextRequest,
     DivisionFilter,
     FormationFilter,
     NumericFilter,
@@ -28,8 +30,22 @@ from rag.planning.planner import (
     TeamCodeFilter,
     TeamSelector,
 )
+from rag.planning.enrichment import (
+    ContextEnrichment,
+    LookupExecution,
+    StructuredEnrichment,
+    StructuredLookupExecutor,
+    TargetEnrichment,
+)
+from rag.planning.lookups import (
+    ContextScopePolicy,
+    LookupPurpose,
+    PlayerSeasonStatsLookup,
+    TeamRosterLookup,
+)
 from rag.planning.resolver import (
     EntityResolver,
+    ContextResolution,
     PLAYER_FIELD_SPECS,
     ResolutionResult,
     ResolutionValidationError,
@@ -86,6 +102,361 @@ Boilerplate that should not be indexed.
 
 
 class RagTests(unittest.TestCase):
+    @staticmethod
+    def _context_test_repository():
+        class FakeRepository:
+            def list_teams(self) -> list[dict]:
+                return [
+                    {
+                        "team_abbr": "ATL",
+                        "team_id": "0200",
+                        "team_name": "Atlanta Falcons",
+                        "team_nick": "Falcons",
+                        "team_conf": "NFC",
+                        "team_division": "NFC South",
+                    }
+                ]
+
+            def resolve_player_selector(self, selector, *, season, week):
+                if selector.names:
+                    return (
+                        [
+                            {
+                                "player_id": "london-id",
+                                "display_name": "Drake London",
+                                "position": "WR",
+                                "position_group": "WR",
+                                "rookie_season": 2022,
+                                "draft_year": 2022,
+                                "player_status": {
+                                    "latest_team": "ATL",
+                                    "jersey_number": "5",
+                                    "status": "ACT",
+                                },
+                            }
+                        ],
+                        [],
+                        False,
+                    )
+                fields = {item.field for item in selector.hard_filters}
+                if fields == {"team", "position_group"}:
+                    return (
+                        [
+                            {
+                                "player_id": "tua-id",
+                                "display_name": "Tua Tagovailoa",
+                                "position": "QB",
+                                "position_group": "QB",
+                                "rookie_season": 2020,
+                                "draft_year": 2020,
+                                "player_status": {
+                                    "latest_team": "ATL",
+                                    "jersey_number": "1",
+                                    "status": "ACT",
+                                },
+                            },
+                            {
+                                "player_id": "penix-id",
+                                "display_name": "Michael Penix Jr.",
+                                "position": "QB",
+                                "position_group": "QB",
+                                "rookie_season": 2024,
+                                "draft_year": 2024,
+                                "player_status": {
+                                    "latest_team": "ATL",
+                                    "jersey_number": "9",
+                                    "status": "ACT",
+                                },
+                            },
+                        ],
+                        [],
+                        False,
+                    )
+                return [], [], False
+
+            def resolve_player_teams(self, player_ids, *, season, week):
+                return {player_id: "ATL" for player_id in player_ids}
+
+        return FakeRepository()
+
+    @staticmethod
+    def _london_context_plan(*, include_context: bool) -> QueryPlan:
+        selector = PlayerSelector(
+            entity_type="player",
+            reference_text="Drake London",
+            names=["Drake London"],
+            identity_confidence=1.0,
+            resolution_basis=PlayerResolutionBasis.EXACT_NAME,
+            hard_filters=[],
+            soft_filters=[],
+            semantic_qualifiers=["quarterback context"],
+        )
+        contexts = []
+        if include_context:
+            contexts.append(
+                ContextRequest(
+                    anchor_selector_index=0,
+                    relation="same_team",
+                    semantic_query=(
+                        "current quarterback situation affecting receiver outlook"
+                    ),
+                    keyword_query="quarterback competition injury starter",
+                    semantic_qualifiers=["quarterback context"],
+                    structured_lookups=[
+                        TeamRosterLookup(
+                            lookup_id="atl-quarterbacks",
+                            purpose=LookupPurpose.EXPAND_CANDIDATES,
+                            operation="team_roster",
+                            season=2026,
+                            week=None,
+                            position="QB",
+                            status=None,
+                        )
+                    ],
+                )
+            )
+        return QueryPlan(
+            semantic_query="current concerns affecting Drake London",
+            keyword_query="Drake London current outlook concerns",
+            intent="current_status",
+            player_mentions=["Drake London"],
+            team_mentions=[],
+            soft_team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[selector],
+            context_requests=contexts,
+            season=2026,
+            week=None,
+            temporal_mode="current",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="multiple_documents",
+        )
+
+    def test_context_branch_unions_indirect_same_team_evidence(self) -> None:
+        direct = REPORT.replace(
+            'id: "alpha-update"', 'id: "london-update"'
+        ).replace(
+            'title: "Alpha returns to practice"',
+            'title: "Drake London role remains stable"',
+        ).replace(
+            'players: ["Alpha Runner"]', 'players: ["Drake London"]'
+        ).replace(
+            'teams: ["TST"]', 'teams: ["ATL"]'
+        ).replace(
+            "Alpha Runner returned to practice after recovering from a hamstring injury.",
+            "Drake London remained the primary Atlanta receiver in practice.",
+        )
+        quarterback = REPORT.replace(
+            'id: "alpha-update"', 'id: "falcons-quarterbacks"'
+        ).replace(
+            'title: "Alpha returns to practice"',
+            'title: "Tua and Penix compete for Falcons quarterback job"',
+        ).replace(
+            'players: ["Alpha Runner"]',
+            'players: ["Tua Tagovailoa", "Michael Penix Jr."]',
+        ).replace(
+            'teams: ["TST"]', 'teams: ["ATL"]'
+        ).replace(
+            "Alpha Runner returned to practice after recovering from a hamstring injury.",
+            "Tua Tagovailoa and Michael Penix Jr. split starting quarterback work.",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            direct_path = root / "london.md"
+            quarterback_path = root / "quarterbacks.md"
+            direct_path.write_text(direct, encoding="utf-8")
+            quarterback_path.write_text(quarterback, encoding="utf-8")
+            store = LocalRAGStore(root / "index.sqlite3")
+            store.build_index(
+                [parse_report(direct_path), parse_report(quarterback_path)]
+            )
+            plan = self._london_context_plan(include_context=True)
+            resolution = EntityResolver(
+                repository=self._context_test_repository()
+            ).resolve(plan)
+            result = QueryPlanExecutor(store).execute(
+                "How does Atlanta's quarterback situation affect Drake London?",
+                plan,
+                resolution,
+                mode="keyword",
+                limit=5,
+                embedding_model="unused",
+            )
+
+        ids = {hit.document.id for hit in result.hits}
+        self.assertEqual(resolution.contexts[0].teams, ["ATL"])
+        self.assertIn("london-update", ids)
+        self.assertIn("falcons-quarterbacks", ids)
+        quarterback_hit = next(
+            hit for hit in result.hits
+            if hit.document.id == "falcons-quarterbacks"
+        )
+        self.assertIn("context:0", quarterback_hit.retrieval_scopes)
+        self.assertEqual(result.strategy, "resolved+context")
+
+    def test_direct_question_does_not_expand_to_team_context(self) -> None:
+        plan = self._london_context_plan(include_context=False)
+        resolution = EntityResolver(
+            repository=self._context_test_repository()
+        ).resolve(plan)
+
+        self.assertEqual(resolution.contexts, [])
+
+    def test_context_request_requires_bounded_player_group_anchor(self) -> None:
+        group = PlayerSelector(
+            entity_type="player",
+            reference_text="Falcons receivers",
+            names=[],
+            identity_confidence=0,
+            resolution_basis=PlayerResolutionBasis.NOT_APPLICABLE,
+            hard_filters=[],
+            soft_filters=[],
+            semantic_qualifiers=[],
+        )
+        with self.assertRaises(ValidationError):
+            QueryPlan(
+                semantic_query="Falcons receiver outlook",
+                keyword_query="Falcons receivers",
+                intent="current_status",
+                player_mentions=[],
+                team_mentions=[],
+                soft_team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[group],
+                context_requests=[
+                    ContextRequest(
+                        anchor_selector_index=0,
+                        relation="same_team",
+                        semantic_query="surrounding team context",
+                        keyword_query="team context",
+                        semantic_qualifiers=[],
+                    )
+                ],
+                season=2026,
+                week=None,
+                temporal_mode="current",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="multiple_documents",
+            )
+
+        bounded_group = group.model_copy(
+            update={
+                "hard_filters": [
+                    TeamCodeFilter(field="team", operator="eq", values=["ATL"]),
+                    PositionGroupFilter(
+                        field="position_group",
+                        operator="eq",
+                        values=["WR"],
+                    ),
+                ]
+            }
+        )
+        plan = QueryPlan(
+            semantic_query="Falcons receiver outlook",
+            keyword_query="Falcons receivers",
+            intent="current_status",
+            player_mentions=[],
+            team_mentions=["ATL"],
+            soft_team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[bounded_group],
+            context_requests=[
+                ContextRequest(
+                    anchor_selector_index=0,
+                    relation="environment",
+                    semantic_query="surrounding team context",
+                    keyword_query="team context",
+                    semantic_qualifiers=[],
+                )
+            ],
+            season=2026,
+            week=None,
+            temporal_mode="current",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="multiple_documents",
+        )
+        resolution = EntityResolver(
+            repository=self._context_test_repository()
+        ).resolve(plan)
+
+        self.assertEqual(resolution.contexts[0].status, "resolved")
+        self.assertEqual(resolution.contexts[0].teams, ["ATL"])
+        self.assertEqual(len(resolution.contexts[0].anchor_entities), 2)
+
+    def test_context_request_resolves_from_team_anchor(self) -> None:
+        team = TeamSelector(
+            entity_type="team",
+            names=["ATL"],
+            hard_filters=[],
+            soft_filters=[],
+            semantic_qualifiers=["offensive environment"],
+        )
+        plan = QueryPlan(
+            semantic_query="Atlanta offense outlook",
+            keyword_query="Atlanta offense outlook",
+            intent="projection",
+            player_mentions=[],
+            team_mentions=["ATL"],
+            soft_team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[team],
+            context_requests=[
+                ContextRequest(
+                    anchor_selector_index=0,
+                    relation="same_team",
+                    semantic_query=(
+                        "quarterback availability and passing environment"
+                    ),
+                    keyword_query="quarterback starter injury competition",
+                    semantic_qualifiers=["quarterback context"],
+                    structured_lookups=[
+                        TeamRosterLookup(
+                            lookup_id="atl-quarterbacks",
+                            purpose=LookupPurpose.EXPAND_CANDIDATES,
+                            operation="team_roster",
+                            season=2026,
+                            week=None,
+                            position="QB",
+                            status=None,
+                        )
+                    ],
+                )
+            ],
+            season=2026,
+            week=None,
+            temporal_mode="current",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="multiple_documents",
+        )
+
+        resolution = EntityResolver(
+            repository=self._context_test_repository()
+        ).resolve(plan)
+
+        context = resolution.contexts[0]
+        self.assertEqual(context.status, "resolved")
+        self.assertEqual(context.teams, ["ATL"])
+        self.assertEqual(
+            [
+                (entity.entity_type, entity.entity_id)
+                for entity in context.anchor_entities
+            ],
+            [("team", "ATL")],
+        )
+        self.assertEqual(
+            context.request.structured_lookups[0].operation,
+            "team_roster",
+        )
+
     def test_formation_schema_matches_normalized_depth_chart_side(self) -> None:
         schema = FormationFilter.model_json_schema()
 
@@ -292,7 +663,200 @@ class RagTests(unittest.TestCase):
             self.assertEqual(second.input_tokens, 0)
             self.assertEqual(second.plan, plan)
 
-    def test_query_planner_retries_separated_team_and_player_group(self) -> None:
+    def test_query_planner_pairs_relative_week_with_current_nfl_season(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parsed_plan = QueryPlan(
+                semantic_query="A.J. Brown Week 1 matchup",
+                keyword_query="A.J. Brown Week 1 matchup",
+                intent="yes_no",
+                player_mentions=["A.J. Brown"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[
+                    PlayerSelector(
+                        entity_type="player",
+                        reference_text="AJ Brown",
+                        names=["A.J. Brown"],
+                        identity_confidence=1.0,
+                        resolution_basis=PlayerResolutionBasis.KNOWN_ALIAS,
+                        filters=[],
+                        semantic_qualifiers=["Week 1 matchup"],
+                    )
+                ],
+                season=None,
+                week=1,
+                temporal_mode="latest",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="single_document",
+            )
+            response = SimpleNamespace(
+                output_parsed=parsed_plan,
+                usage=SimpleNamespace(input_tokens=50, output_tokens=20),
+            )
+            planner = QueryPlanner(
+                index_path=Path(directory) / "index.sqlite3",
+                model="test-planner",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=lambda **_: response)
+                ),
+            )
+
+            result = planner.plan(
+                "Does AJ Brown have a good Week 1 matchup?",
+                planning_date=date(2026, 8, 20),
+                use_cache=False,
+            )
+
+            self.assertEqual(result.plan.season, 2026)
+            self.assertEqual(result.plan.week, 1)
+
+    def test_query_planner_gives_current_nfl_season_only_to_luna(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plan = QueryPlan(
+                semantic_query="test query",
+                keyword_query="test query",
+                intent="fact",
+                player_mentions=[],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[],
+                season=None,
+                week=None,
+                temporal_mode="none",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="single_document",
+            )
+            response = SimpleNamespace(
+                output_parsed=plan,
+                usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+            )
+
+            luna_parse = Mock(return_value=response)
+            luna_planner = QueryPlanner(
+                index_path=Path(directory) / "luna.sqlite3",
+                model="gpt-5.6-luna",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=luna_parse)
+                ),
+            )
+            luna_planner.plan(
+                "test",
+                planning_date=date(2026, 8, 20),
+                use_cache=False,
+            )
+
+            luna_input = luna_parse.call_args.kwargs["input"][1]["content"]
+            self.assertIn("Current date: 2026-08-20", luna_input)
+            self.assertIn("Current NFL season: 2026", luna_input)
+
+            terra_parse = Mock(return_value=response)
+            terra_planner = QueryPlanner(
+                index_path=Path(directory) / "terra.sqlite3",
+                model="gpt-5.6-terra",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=terra_parse)
+                ),
+            )
+            terra_planner.plan(
+                "test",
+                planning_date=date(2026, 8, 20),
+                use_cache=False,
+            )
+
+            terra_input = terra_parse.call_args.kwargs["input"][1]["content"]
+            self.assertIn("Current date: 2026-08-20", terra_input)
+            self.assertNotIn("Current NFL season:", terra_input)
+
+    def test_query_planner_retries_schema_incompatible_direct_plan_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            selector = PlayerSelector(
+                entity_type="player",
+                reference_text="AJ Brown",
+                names=["A.J. Brown"],
+                identity_confidence=1.0,
+                resolution_basis=PlayerResolutionBasis.KNOWN_ALIAS,
+                filters=[],
+                semantic_qualifiers=["Week 1 flex decision"],
+            )
+            corrected_plan = QueryPlan(
+                semantic_query="A.J. Brown Week 1 flex outlook",
+                keyword_query="A.J. Brown Week 1 flex",
+                intent="comparison",
+                player_mentions=["A.J. Brown"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[selector],
+                season=2026,
+                week=1,
+                temporal_mode="latest",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="per_entity",
+            )
+            invalid_plan = corrected_plan.model_dump(mode="json")
+            invalid_plan["entity_selectors"][0]["structured_lookups"] = [
+                {
+                    "lookup_id": "week-one-ecr",
+                    "purpose": "reranker_context",
+                    "operation": "ecr_ranking",
+                    "season": 2026,
+                    "positions": ["RB", "WR"],
+                    "scoring_format": "ppr",
+                    "league_format": "redraft_1qb",
+                    "snapshot_type": "current",
+                    "as_of_date": None,
+                    "minimum_overall_rank": None,
+                    "maximum_overall_rank": None,
+                    "limit": 10,
+                }
+            ]
+            responses = Mock(
+                side_effect=[
+                    SimpleNamespace(
+                        output_parsed=invalid_plan,
+                        usage=SimpleNamespace(input_tokens=50, output_tokens=20),
+                    ),
+                    SimpleNamespace(
+                        output_parsed=corrected_plan,
+                        usage=SimpleNamespace(input_tokens=55, output_tokens=21),
+                    ),
+                ]
+            )
+            planner = QueryPlanner(
+                index_path=Path(directory) / "index.sqlite3",
+                model="gpt-5.6-luna",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=responses)
+                ),
+            )
+
+            result = planner.plan(
+                "Who should I start Week 1, AJ Brown or ETN?",
+                planning_date=date(2026, 8, 20),
+                use_cache=False,
+            )
+
+            self.assertEqual(responses.call_count, 2)
+            self.assertEqual(result.plan, corrected_plan)
+            self.assertEqual(result.attempts, 2)
+            self.assertTrue(result.retried)
+            self.assertIsNotNone(result.retry_reason)
+            retry_input = responses.call_args_list[1].kwargs["input"]
+            self.assertIn(
+                "Correction required",
+                retry_input[1]["content"],
+            )
+            self.assertIn(
+                "Specific-player target lookups",
+                retry_input[1]["content"],
+            )
+
+    def test_query_planner_does_not_apply_issue_specific_scope_repair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             player_group = PlayerSelector(
                 entity_type="player",
@@ -331,32 +895,11 @@ class RagTests(unittest.TestCase):
                 needs_baseline=False,
                 evidence_strategy="single_document",
             )
-            repaired_group = player_group.model_copy(
-                update={
-                    "hard_filters": [
-                        TeamCodeFilter(
-                            field="team",
-                            operator="eq",
-                            values=["LAC"],
-                        ),
-                        *player_group.filters,
-                    ]
-                }
-            )
-            repaired_plan = initial_plan.model_copy(
-                update={"entity_selectors": [repaired_group]}
-            )
             responses = Mock(
-                side_effect=[
-                    SimpleNamespace(
-                        output_parsed=initial_plan,
-                        usage=SimpleNamespace(input_tokens=50, output_tokens=20),
-                    ),
-                    SimpleNamespace(
-                        output_parsed=repaired_plan,
-                        usage=SimpleNamespace(input_tokens=70, output_tokens=25),
-                    ),
-                ]
+                return_value=SimpleNamespace(
+                    output_parsed=initial_plan,
+                    usage=SimpleNamespace(input_tokens=50, output_tokens=20),
+                )
             )
             planner = QueryPlanner(
                 index_path=Path(directory) / "index.sqlite3",
@@ -371,21 +914,10 @@ class RagTests(unittest.TestCase):
                 planning_date=date(2026, 8, 13),
             )
 
-            self.assertEqual(responses.call_count, 2)
-            self.assertEqual(result.scope_retries, 1)
-            self.assertEqual(result.scope_issues, ())
-            self.assertEqual(result.input_tokens, 120)
-            self.assertEqual(result.output_tokens, 45)
-            repaired_selector = result.plan.entity_selectors[0]
-            self.assertEqual(repaired_selector.entity_type, "player")
-            self.assertTrue(
-                any(item.field == "team" for item in repaired_selector.filters)
-            )
-            retry_messages = responses.call_args_list[1].kwargs["input"]
-            self.assertIn(
-                "Do not merge scopes automatically",
-                retry_messages[-1]["content"],
-            )
+            self.assertEqual(responses.call_count, 1)
+            self.assertEqual(result.input_tokens, 50)
+            self.assertEqual(result.output_tokens, 20)
+            self.assertEqual(result.plan, initial_plan)
 
     def test_truncated_player_group_stops_before_retrieval(self) -> None:
         group = PlayerSelector(
@@ -1258,12 +1790,155 @@ class RagTests(unittest.TestCase):
         self.assertFalse(result.event.triggered)
         self.assertEqual(result.event.signals[0].reasons, ())
 
-    def test_duplicate_names_are_sent_with_context_and_selected_by_id(self) -> None:
+    def test_suffix_variant_candidates_are_sent_through_existing_escalation(self) -> None:
         class FakeRepository:
             def list_teams(self) -> list[dict]:
                 return []
 
             def resolve_player_selector(self, selector, *, season, week):
+                if selector.names in (["travis etienne"], ["Travis Etienne"]):
+                    return (
+                        [
+                            {
+                                "player_id": "etienne-id",
+                                "display_name": "Travis Etienne",
+                                "position": "RB",
+                                "position_group": "RB",
+                                "rookie_season": 2021,
+                                "draft_year": 2021,
+                                "player_status": {
+                                    "latest_team": "JAX",
+                                    "jersey_number": "1",
+                                    "status": "ACT",
+                                },
+                            }
+                        ],
+                        [],
+                        False,
+                    )
+                return [], [], False
+
+        selector = PlayerSelector(
+            entity_type="player",
+            reference_text="etn",
+            names=["Travis Etienne Jr."],
+            identity_confidence=0.98,
+            resolution_basis=PlayerResolutionBasis.KNOWN_ALIAS,
+            filters=[],
+            semantic_qualifiers=["Week 1 flex comparison"],
+        )
+        plan = QueryPlan(
+            semantic_query="Travis Etienne Jr. Week 1 outlook",
+            keyword_query="Travis Etienne Jr. Week 1",
+            intent="comparison",
+            player_mentions=["Travis Etienne Jr."],
+            team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[selector],
+            season=2026,
+            week=1,
+            temporal_mode="none",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="per_entity",
+        )
+        response = SimpleNamespace(
+            output_parsed=PlayerIdentityResponse(
+                decisions=[
+                    PlayerIdentityDecision(
+                        selector_index=0,
+                        status="resolved",
+                        canonical_name="Travis Etienne",
+                        player_id="etienne-id",
+                        alternatives=[],
+                    )
+                ]
+            ),
+            usage=SimpleNamespace(
+                input_tokens=100,
+                output_tokens=20,
+                input_tokens_details=SimpleNamespace(cached_tokens=0),
+            ),
+        )
+        captured = {}
+
+        def parse(**kwargs):
+            captured.update(kwargs)
+            return response
+
+        resolver = EntityResolver(repository=FakeRepository())
+        initial = resolver.resolve(plan)
+        self.assertEqual(initial.selectors[0].status, "unresolved")
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = EscalationRouter(
+                index_path=Path(directory) / "index.sqlite3",
+                model="test-sol",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=parse)
+                ),
+            ).route(
+                "Who should I start, A.J. Brown or ETN?",
+                plan,
+                initial,
+                resolver=resolver,
+            )
+
+        request = json.loads(captured["input"][1]["content"])
+        issue = request["references"][0]
+        self.assertEqual(issue["database_status"], "unresolved")
+        self.assertEqual(issue["database_match_method"], "suffix_normalized")
+        self.assertEqual(issue["database_match_count"], 1)
+        self.assertEqual(
+            issue["database_matches"][0]["display_name"],
+            "Travis Etienne",
+        )
+        self.assertEqual(
+            issue["database_matches"][0]["player_id"],
+            "etienne-id",
+        )
+        self.assertTrue(result.event.triggered)
+        self.assertTrue(result.event.decisions[0].grounded)
+        self.assertEqual(result.resolution.selectors[0].status, "resolved")
+        self.assertEqual(result.resolution.players[0].entity_id, "etienne-id")
+        self.assertEqual(result.plan.player_mentions, ["Travis Etienne"])
+
+    def test_duplicate_names_are_sent_with_context_and_selected_by_id(self) -> None:
+        class FakeRepository:
+            def list_teams(self) -> list[dict]:
+                return [
+                    {
+                        "team_abbr": "MIN",
+                        "team_id": "1600",
+                        "team_name": "Minnesota Vikings",
+                        "team_nick": "Vikings",
+                        "team_conf": "NFC",
+                        "team_division": "NFC North",
+                    }
+                ]
+
+            def resolve_player_selector(self, selector, *, season, week):
+                if not selector.names:
+                    return (
+                        [
+                            {
+                                "player_id": "vikings-qb-id",
+                                "display_name": "Example Vikings QB",
+                                "position": "QB",
+                                "position_group": "QB",
+                                "rookie_season": 2024,
+                                "draft_year": 2024,
+                                "player_status": {
+                                    "latest_team": "MIN",
+                                    "jersey_number": "9",
+                                    "status": "ACT",
+                                },
+                            }
+                        ],
+                        [],
+                        False,
+                    )
                 if selector.names != ["Justin Jefferson"]:
                     return [], [], False
                 return (
@@ -1316,6 +1991,26 @@ class RagTests(unittest.TestCase):
             team_mentions=[],
             negative_focus=[],
             entity_selectors=[selector],
+            context_requests=[
+                ContextRequest(
+                    anchor_selector_index=0,
+                    relation="same_team",
+                    semantic_query="Minnesota quarterback situation",
+                    keyword_query="Minnesota quarterback starter",
+                    semantic_qualifiers=["quarterback context"],
+                    structured_lookups=[
+                        TeamRosterLookup(
+                            lookup_id="min-quarterbacks",
+                            purpose=LookupPurpose.EXPAND_CANDIDATES,
+                            operation="team_roster",
+                            season=2026,
+                            week=None,
+                            position="QB",
+                            status=None,
+                        )
+                    ],
+                )
+            ],
             season=2026,
             week=None,
             temporal_mode="current",
@@ -1375,6 +2070,16 @@ class RagTests(unittest.TestCase):
         self.assertEqual(candidates[0]["jersey_number"], "18")
         self.assertEqual(result.resolution.selectors[0].status, "resolved")
         self.assertEqual(result.resolution.players[0].entity_id, "vikings-wr-id")
+        self.assertEqual(result.resolution.contexts[0].status, "resolved")
+        self.assertEqual(result.resolution.contexts[0].teams, ["MIN"])
+        self.assertEqual(
+            result.resolution.contexts[0].anchor_entities[0].entity_id,
+            "vikings-wr-id",
+        )
+        self.assertEqual(
+            result.plan.context_requests[0].structured_lookups[0].lookup_id,
+            "min-quarterbacks",
+        )
         self.assertEqual(result.event.decisions[0].player_id, "vikings-wr-id")
         self.assertTrue(result.event.decisions[0].grounded)
 
@@ -1846,7 +2551,7 @@ class RagTests(unittest.TestCase):
             self.assertEqual(first.input_tokens, 200)
             self.assertEqual(first.cached_input_tokens, 20)
             self.assertIsNone(first.error)
-            with sqlite3.connect(root / "index.sqlite3") as connection:
+            with closing(sqlite3.connect(root / "index.sqlite3")) as connection:
                 event_judgments = json.loads(
                     connection.execute(
                         "SELECT judgments_json FROM rerank_events ORDER BY id DESC"
@@ -2149,6 +2854,107 @@ class RagTests(unittest.TestCase):
                 [hit.document.id for hit in result.hits],
                 ["primary", "distinct"],
             )
+
+    def test_reranker_never_fills_output_with_irrelevant_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "alpha.md"
+            report_path.write_text(REPORT, encoding="utf-8")
+            template = parse_report(report_path)
+            direct = replace(template, id="direct")
+            context = replace(
+                template,
+                id="context",
+                body="The team described the surrounding workload context.",
+            )
+            irrelevant = replace(
+                template,
+                id="irrelevant",
+                body="An unrelated team discussed a separate player.",
+            )
+            hits = [
+                SearchHit(irrelevant, 0.04, "hybrid", 1, 1),
+                SearchHit(direct, 0.03, "hybrid", 2, 2),
+                SearchHit(context, 0.02, "hybrid", 3, 3),
+            ]
+            response = SimpleNamespace(
+                output_parsed=RerankResponse(
+                    judgments=[
+                        RerankJudgment(
+                            document_id="irrelevant",
+                            relevance_score=100,
+                            relationship=EvidenceRelationship.IRRELEVANT,
+                            temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
+                            redundant_with=None,
+                            reason="Does not address the requested subject.",
+                        ),
+                        RerankJudgment(
+                            document_id="direct",
+                            relevance_score=70,
+                            relationship=EvidenceRelationship.DIRECT,
+                            temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.SUPPORTS,
+                            redundant_with=None,
+                            reason="Directly answers the question.",
+                        ),
+                        RerankJudgment(
+                            document_id="context",
+                            relevance_score=55,
+                            relationship=EvidenceRelationship.SUPPORTING_CONTEXT,
+                            temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
+                            redundant_with=None,
+                            reason="Provides material surrounding context.",
+                        ),
+                    ],
+                    evidence_sufficiency=EvidenceSufficiency.STRONG,
+                    sufficiency_reason="Direct and contextual evidence exists.",
+                ),
+                usage=None,
+            )
+            plan = QueryPlan(
+                semantic_query="Alpha role",
+                keyword_query="Alpha role",
+                intent="current_status",
+                player_mentions=["Alpha Runner"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[],
+                season=2026,
+                week=None,
+                temporal_mode="current",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="multiple_documents",
+            )
+            reranker = ReportReranker(
+                index_path=root / "index.sqlite3",
+                model="test-luna",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=lambda **_: response)
+                ),
+            )
+
+            result = reranker.rerank(
+                "What is Alpha's role?",
+                plan,
+                ResolutionResult(selectors=[]),
+                hits,
+                limit=3,
+            )
+
+        self.assertEqual(
+            [hit.document.id for hit in result.hits],
+            ["direct", "context"],
+        )
+        irrelevant_result = next(
+            item
+            for item in result.ranked_candidates
+            if item.hit.document.id == "irrelevant"
+        )
+        self.assertIsNone(irrelevant_result.final_rank)
 
 
 if __name__ == "__main__":

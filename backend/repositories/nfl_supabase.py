@@ -297,7 +297,64 @@ def get_team_roster(
         query = query.eq("position", position)
     if status is not None:
         query = query.eq("status", status)
-    return query.order("position").limit(100).execute().data
+    rows = query.order("position").limit(100).execute().data
+    names = get_player_names(
+        [str(row["player_id"]) for row in rows if row.get("player_id")]
+    )
+    return [
+        {
+            **row,
+            "player_name": names.get(str(row.get("player_id"))),
+        }
+        for row in rows
+    ]
+
+
+def get_current_team_roster(
+    team: str,
+    season: int,
+    position: str | None,
+    status: str | None,
+) -> list[dict]:
+    """Return the latest player-status snapshot in weekly-roster shape."""
+    query = (
+        get_supabase_client()
+        .table("player_status")
+        .select(
+            "player_id,latest_team,jersey_number,position,status,ngs_status,"
+            "years_of_experience,last_season"
+        )
+        .eq("latest_team", team)
+        # player_status includes historical players whose latest career team
+        # was this team. last_season is therefore the required current-snapshot
+        # eligibility boundary, not merely useful metadata.
+        .eq("last_season", season)
+    )
+    if position is not None:
+        query = query.eq("position", position)
+    if status is not None:
+        query = query.eq("status", status)
+    rows = query.order("position").limit(100).execute().data
+    names = get_player_names(
+        [str(row["player_id"]) for row in rows if row.get("player_id")]
+    )
+    return [
+        {
+            "player_id": row["player_id"],
+            "player_name": names.get(str(row["player_id"])),
+            "season": season,
+            "week": None,
+            "game_type": None,
+            "team": row["latest_team"],
+            "position": row["position"],
+            "depth_chart_position": None,
+            "jersey_number": row.get("jersey_number"),
+            "status": row["status"],
+            "status_description_abbr": row.get("ngs_status"),
+            "years_exp": row.get("years_of_experience"),
+        }
+        for row in rows
+    ]
 
 
 def get_player_season_candidates(

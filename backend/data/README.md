@@ -22,6 +22,8 @@ with a different content mode later.
 ```text
 processed/
 ├── manifest.json
+├── orchestration/
+│   └── request_router.sqlite3
 ├── reports/
 │   └── local_rag.sqlite3
 ├── reference/
@@ -58,4 +60,5 @@ processed/
 - `current/` contains overwriteable active-season and player-status data.
 - `seasons/` contains normalized historical tables partitioned by season.
 - `reports/` contains the rebuildable local keyword/vector retrieval index.
+- `orchestration/` contains the rebuildable request-route cache and telemetry.
 - `manifest.json` records processing times, output shapes, and unmatched rows.

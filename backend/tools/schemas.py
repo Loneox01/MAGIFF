@@ -188,7 +188,12 @@ GET_PLAYER_SNAP_COUNTS_TOOL = {
 GET_TEAM_ROSTER_TOOL = {
     "type": "function",
     "name": "get_team_roster",
-    "description": "Get a team's weekly roster; null week uses its latest available week.",
+    "description": (
+        "Get a team's weekly roster; null week uses its latest available week. "
+        "If the current season has no weekly rows yet, the result explicitly "
+        "falls back to the current player-status snapshot, which can be a "
+        "preseason-sized roster rather than a finalized weekly active roster."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -496,7 +501,11 @@ RANK_PLAYERS_BY_ECR_TOOL = {
     "description": (
         "Rank players from one expert-consensus-ranking snapshot. Use for draft "
         "rankings, positional rankings, expert disagreement, and ranking movement. "
-        "The tool automatically uses the latest snapshot on or before as_of_date."
+        "The tool automatically uses the latest snapshot on or before as_of_date. "
+        "FantasyPros redraft ECR assumes three starting WR slots, which can elevate "
+        "WRs relative to two-WR leagues and slightly depress other positions. "
+        "Mention this lineup mismatch when it materially affects an interpretation "
+        "or draft recommendation."
     ),
     "parameters": {
         "type": "object",
@@ -588,7 +597,10 @@ COMPARE_ECR_TO_RESULTS_TOOL = {
     "description": (
         "Compare a stored ECR snapshot with actual regular-season fantasy results "
         "in one call. Use for draft steals, busts, ECR accuracy, and positional "
-        "finish analysis. Positive rank_difference means the player outperformed ECR."
+        "finish analysis. Positive rank_difference means the player outperformed ECR. "
+        "FantasyPros redraft ECR assumes three starting WR slots, which can elevate "
+        "WRs relative to two-WR leagues and slightly depress other positions. Note "
+        "that context when it materially affects the comparison."
     ),
     "parameters": {
         "type": "object",

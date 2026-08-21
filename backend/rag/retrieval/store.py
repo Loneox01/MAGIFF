@@ -75,6 +75,7 @@ class SearchHit:
     method: str
     keyword_rank: int | None = None
     vector_rank: int | None = None
+    retrieval_scopes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
