@@ -34,7 +34,7 @@ class ReportDocument:
     fetched_at: str
     players: tuple[str, ...]
     teams: tuple[str, ...]
-    season: int
+    season: int | None
     document_type: str
     storyline: str
     content_mode: str

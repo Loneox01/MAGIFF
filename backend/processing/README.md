@@ -45,3 +45,23 @@ python -m backend.database.load_supabase --workflow fantasy-reference
 Depth-chart source formats are isolated in
 `normalization/depth_charts.py`. Add another adapter there if nflverse changes
 its schema for an older or future season.
+
+FantasyPros player-news reports are normalized separately from the seasonal NFL
+tables. The provider player ID is matched directly to the existing external-ID
+crosswalk; Luna supplies a bounded document type and material secondary-player
+mentions, which are accepted only after deterministic player-catalog resolution:
+
+```bash
+cd backend
+python -m processing.reports.fantasypros
+```
+
+Database-ready JSON documents are written to
+`data/processed/reports/documents/fantasypros/`. Unchanged source content is
+skipped when the raw hash, model, prompt version, and normalizer version match.
+Use `--force` to deliberately rerun metadata extraction.
+
+The scheduled `jobs.refresh_reports` workflow uses the same normalizer with a
+bounded Supabase-backed catalog, so a deployed runner does not depend on ignored
+local Parquet files. The local command above retains the Parquet catalog for
+offline processing and replay.

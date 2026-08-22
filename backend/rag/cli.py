@@ -8,6 +8,7 @@ from .config import (
     DEFAULT_ESCALATION_MODEL,
     DEFAULT_INDEX_PATH,
     DEFAULT_PLANNER_MODEL,
+    DEFAULT_REPORT_STORE,
     DEFAULT_RERANK_CANDIDATES,
     DEFAULT_RERANK_MODEL,
 )
@@ -28,6 +29,7 @@ from .planning.router import (
     EscalationRouter,
 )
 from .retrieval.executor import QueryPlanExecutor
+from .retrieval.factory import create_report_store
 from .retrieval.reranker import (
     MAX_RERANK_CANDIDATES,
     ReportReranker,
@@ -41,7 +43,16 @@ def _add_index_path(parser: argparse.ArgumentParser) -> None:
         "--index-path",
         type=Path,
         default=DEFAULT_INDEX_PATH,
-        help="SQLite index path (defaults inside ignored processed data)",
+        help="Local planner/cache path (and SQLite report index when selected)",
+    )
+
+
+def _add_store(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--store",
+        choices=("local", "supabase"),
+        default=DEFAULT_REPORT_STORE,
+        help="Report retrieval store (defaults to RAG_REPORT_STORE or supabase)",
     )
 
 
@@ -110,7 +121,7 @@ def _add_planner_options(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build and test the local report retrieval index."
+        description="Build and test report retrieval stores."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -172,6 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_planner_options(search_parser, include_enable_flag=True)
     _add_index_path(search_parser)
+    _add_store(search_parser)
 
     plan_parser = subparsers.add_parser(
         "plan",
@@ -193,8 +205,9 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--top-k", type=int, default=3)
     _add_index_path(evaluate_parser)
 
-    status_parser = subparsers.add_parser("status", help="Show local index status")
+    status_parser = subparsers.add_parser("status", help="Show report-store status")
     _add_index_path(status_parser)
+    _add_store(status_parser)
 
     return parser
 
@@ -385,7 +398,10 @@ def _print_rerank(result: RerankResult, *, include_judgments: bool) -> None:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    store = LocalRAGStore(index_path=args.index_path)
+    if args.command in {"search", "status"}:
+        store = create_report_store(args.store, index_path=args.index_path)
+    else:
+        store = LocalRAGStore(index_path=args.index_path)
 
     try:
         if args.command == "index":

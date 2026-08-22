@@ -24,8 +24,8 @@ main answer agent (Terra)
 Structured domains currently map to player lookup, player statistics, team
 statistics, schedules, rosters/depth charts, and ECR. Multiple domains and the
 report capability can be selected for mixed questions. If the router call fails,
-the terminal logs the failure and the main agent receives all local capabilities
-as a safe availability fallback.
+the terminal logs the failure and the main agent receives all registered
+capabilities as a safe availability fallback.
 
 Routes and token telemetry are stored in the ignored
 `data/processed/orchestration/request_router.sqlite3` file. Identical requests

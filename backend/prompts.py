@@ -9,6 +9,8 @@ Prompt locations:
   ``rag/planning/context_planner.py``.
 - PLAYER_IDENTITY_INSTRUCTIONS: conditional identity escalation in
   ``rag/planning/router.py``.
+- REPORT_METADATA_INSTRUCTIONS: bounded provider-news enrichment in
+  ``processing/reports/fantasypros.py``.
 - REPORT_RERANKER_INSTRUCTIONS: report evidence reranker in
   ``rag/retrieval/reranker.py``.
 
@@ -255,6 +257,39 @@ the question, alter its intent, or infer events. Return a canonical full player
 name only when one player is clearly intended. Otherwise set canonical_name and
 player_id to null; return ambiguous with plausible canonical alternatives or
 unknown when the reference cannot be grounded.
+"""
+
+
+# Used by: backend/processing/reports/fantasypros.py
+REPORT_METADATA_INSTRUCTIONS = """Extract normalized metadata from provider-supplied NFL news reports.
+
+Return metadata only, never an answer or additional reporting. Treat every
+report as independent and return exactly one result for each supplied external
+ID. Use only the supplied title, description, fantasy-impact text, source team,
+and source player identity. Do not introduce facts from memory.
+
+Player mentions:
+- Include NFL players who are a primary subject or whose availability, role,
+  workload, opportunity, or fantasy outlook is materially affected by the
+  reported event. Do not include coaches, agents, reporters, teams, or players
+  mentioned only as irrelevant background.
+- Copy the exact referring phrase from the report into reference_text. Supply
+  one best official full-name candidate when possible, confidence from 0 to 1,
+  and the enumerated resolution basis that truthfully describes the conversion.
+- exact_name means the official full name appears in the report; known_alias is
+  a broadly recognized nickname, abbreviation, shortened name, or canonical
+  name variant; contextual_alias requires surrounding report context to identify
+  the player; inferred is an unsupported best guess. Never invent an internal
+  database ID.
+- Mark the main subject as primary_subject, a player whose fantasy situation is
+  materially changed as materially_affected, and another materially useful
+  football reference as contextual.
+
+Document type:
+- Choose exactly one enumerated type describing the report's main new
+  information. Prefer the concrete reported event over generic fantasy analysis.
+- Use general_news when no narrower type is supported. Confidence reflects the
+  classification only; it is not player-identity confidence.
 """
 
 

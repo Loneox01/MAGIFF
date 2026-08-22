@@ -8,10 +8,15 @@ publication dates, entities, and source URLs remain attributable:
 ```text
 raw/
 └── reports/
-    └── YYYY-MM-DD/
-        ├── manifest.json
-        └── source_name/
-            └── YYYY-MM-DD_article-slug.md
+    ├── YYYY-MM-DD/
+    │   ├── manifest.json
+    │   └── source_name/
+    │       └── YYYY-MM-DD_article-slug.md
+    └── sources/
+        └── fantasypros/
+            ├── items/
+            ├── versions/
+            └── latest_run.json
 ```
 
 The initial seed records use `content_mode: source_summary`: they contain
@@ -25,7 +30,13 @@ processed/
 ├── orchestration/
 │   └── request_router.sqlite3
 ├── reports/
-│   └── local_rag.sqlite3
+│   ├── local_rag.sqlite3
+│   ├── latest_run.json
+│   ├── load_latest_run.json
+│   ├── evaluation_logs/
+│   └── documents/
+│       └── fantasypros/
+│           └── {external_report_id}.json
 ├── reference/
 │   ├── players.parquet
 │   ├── player_external_ids.parquet
@@ -59,6 +70,9 @@ processed/
 - `reference/` contains slowly changing player and team identity data.
 - `current/` contains overwriteable active-season and player-status data.
 - `seasons/` contains normalized historical tables partitioned by season.
-- `reports/` contains the rebuildable local keyword/vector retrieval index.
+- `reports/` contains database-ready normalized report documents, the latest
+  metadata-processing run summary, and the rebuildable local keyword/vector
+  retrieval index. Its ignored `evaluation_logs/` directory contains temporary
+  local baselines that should be removed after they become durable fixtures.
 - `orchestration/` contains the rebuildable request-route cache and telemetry.
 - `manifest.json` records processing times, output shapes, and unmatched rows.

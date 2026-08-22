@@ -1,8 +1,9 @@
-# Local report retrieval
+# Report retrieval
 
-This is the first, deliberately small RAG layer. It parses the report Markdown
-records, treats each short report as one chunk, indexes text with SQLite FTS5,
-and optionally caches OpenAI embeddings for local cosine search.
+This package owns the report-retrieval pipeline used by the agent. Supabase
+PostgreSQL FTS and pgvector are the deployed/default store; the original
+Markdown and SQLite implementation remains an explicit local regression
+fallback. Short provider reports currently remain one chunk each.
 
 ```text
 rag/
@@ -40,10 +41,10 @@ typed structured enrichment through existing read-only NFL tools
 branch-scoped executor (independent targets + bounded context)
         |
         v
-SQLite index (keyword text + cached vectors)
+configured report store (Supabase by default; SQLite for local regression)
         |
-        +--> keyword search (BM25)
-        +--> vector search (cosine similarity)
+        +--> keyword search (PostgreSQL FTS or local BM25)
+        +--> vector search (pgvector or local cosine similarity)
         `--> hybrid search (reciprocal-rank fusion)
                     |
                     v
@@ -63,10 +64,11 @@ agent. Result limits are ceilings, so fewer reports are returned when the
 remaining candidates are irrelevant. The CLI intentionally remains useful for
 inspecting raw retrieval and reranker diagnostics beneath that gate.
 
-The current store is local SQLite plus cached embeddings. It is injected behind
-the pipeline boundary so documents, chunks, and vector search can later move to
-Supabase/pgvector without changing the `search_reports(query, limit)` tool
-contract.
+The default store is Supabase/PostgreSQL FTS plus pgvector. Set
+`RAG_REPORT_STORE=local` or pass `--store local` to retain the rebuildable
+SQLite regression index. Both stores use the same `search_reports(query, limit)`
+tool contract and the same application-side reciprocal-rank fusion, reranker,
+and evidence gate.
 
 The generated SQLite file lives under `data/processed/` and is already ignored
 by Git. Unchanged report embeddings and repeated query embeddings are reused.
@@ -74,14 +76,19 @@ by Git. Unchanged report embeddings and repeated query embeddings are reused.
 Run these commands from `backend/`:
 
 ```bash
-# Free/local first pass: build and test keyword retrieval.
+# Optional local regression index.
 python -m rag.cli index
-python -m rag.cli search "What is the latest Kenyon Sadiq injury update?"
+python -m rag.cli search "What is the latest Kenyon Sadiq injury update?" --store local
 python -m rag.cli evaluate
 
 # Add semantic retrieval. This reads OPENAI_API_KEY from the root .env.
 python -m rag.cli index --with-embeddings
-python -m rag.cli search "Who gains opportunity if Price misses time?" --mode hybrid
+python -m rag.cli search "Who gains opportunity if Price misses time?" --mode hybrid --store local
+
+# Supabase retrieval (the default). Requires the report migrations and loaded
+# chunks, plus SUPABASE_URL, SUPABASE_SECRET_KEY, and OPENAI_API_KEY.
+python -m rag.cli status --store supabase
+python -m rag.cli search "What is Michael Penix Jr.'s latest status?" --mode hybrid --store supabase
 
 # Inspect both planning stages, then compare unplanned and planned retrieval.
 python -m rag.cli plan "What changed in the Seahawks backfield after July 25?"
@@ -105,8 +112,9 @@ python -m rag.cli status
 ```
 
 `--with-embeddings` only embeds new or changed reports. Vector and hybrid
-queries call the embeddings API once per new query; identical queries are
-served from the local query cache.
+queries call the embeddings API once per new query. Identical Supabase queries
+are reused within the running process; the local store persists its query cache
+in SQLite.
 
 `--rerank` expands retrieval to a configurable candidate pool (20 by default),
 sends the question, finalized plan, resolved entities, and compact candidate
@@ -272,5 +280,3 @@ configuration, and canonical report boundaries.
 - Required unresolved metadata does not yet produce a dedicated clarification
   status. The tool exposes unresolved constraints and withholds weak evidence,
   but broader punt/degraded behavior still needs calibration.
-- The same interface can later move from local cosine search to Supabase
-  Postgres/pgvector without changing the report ingestion format.

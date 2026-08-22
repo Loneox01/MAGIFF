@@ -16,6 +16,7 @@ DEFAULT_EMBEDDING_MODEL = os.getenv(
     "OPENAI_EMBEDDING_MODEL",
     "text-embedding-3-small",
 )
+DEFAULT_REPORT_STORE = os.getenv("RAG_REPORT_STORE", "supabase").strip().lower()
 DEFAULT_PLANNER_MODEL = os.getenv(
     "OPENAI_PLANNER_MODEL",
     "gpt-5.6-luna",

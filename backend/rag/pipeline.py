@@ -24,6 +24,7 @@ from .planning.resolver import (
 )
 from .planning.router import EscalationRouter
 from .retrieval.executor import QueryPlanExecutor
+from .retrieval.factory import create_report_store
 from .retrieval.reranker import MAX_RERANK_CANDIDATES, ReportReranker
 from .retrieval.store import LocalRAGStore, SearchHit
 
@@ -167,7 +168,7 @@ class ReportRetrievalPipeline:
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         candidate_limit: int = DEFAULT_RERANK_CANDIDATES,
     ) -> None:
-        self.store = store or LocalRAGStore(cache_path)
+        self.store = store or create_report_store(index_path=cache_path)
         self.planner = planner or QueryPlanner(index_path=cache_path)
         self.context_planner = context_planner or ContextPlanner(
             index_path=cache_path,
