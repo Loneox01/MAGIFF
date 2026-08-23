@@ -28,8 +28,8 @@ planner, embeddings, reranker, or answer model.
 |---|---:|---|---|
 | `player` | No | Full or partial player name | Any player |
 | `team` | No | Team abbreviation or official name | Any team |
-| `count` | No | Integer from 1 through 10 | 5 |
-| `detail` | No | `headlines`, `summary`, or `full` | `summary` |
+| `count` | No | Integer from 1 through 10 | 3 |
+| `detail` | No | `headlines`, `summary`, or `full` | `headlines` |
 
 Examples:
 
@@ -40,6 +40,9 @@ Examples:
 /news team:TB detail:summary
 /news player:Kenny Gainwell team:TB count:3 detail:full
 ```
+
+Bare `/news` therefore stays compact: it returns only the three newest linked
+headlines and their source/date metadata.
 
 `full` means the complete text stored by MAGIFF, which may be a provider news
 blurb rather than the full article at the linked source. Full view is capped at

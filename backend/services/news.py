@@ -11,7 +11,7 @@ from database.client import get_supabase_client
 from repositories import nfl_supabase
 
 
-DEFAULT_NEWS_COUNT = 5
+DEFAULT_NEWS_COUNT = 3
 MAX_NEWS_COUNT = 10
 MAX_FULL_NEWS_COUNT = 3
 OPTIONAL_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
@@ -37,7 +37,7 @@ class NewsOutcome(StrEnum):
 @dataclass(frozen=True)
 class NewsQuery:
     count: int = DEFAULT_NEWS_COUNT
-    detail: NewsDetail = NewsDetail.SUMMARY
+    detail: NewsDetail = NewsDetail.HEADLINES
     player: str | None = None
     team: str | None = None
 

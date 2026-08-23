@@ -2,7 +2,7 @@
 -- This intentionally bypasses embeddings, hybrid search, planning, and reranking.
 
 create or replace function public.get_recent_reports(
-    match_count integer default 5,
+    match_count integer default 3,
     filter_player_id uuid default null,
     filter_team text default null
 )

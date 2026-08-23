@@ -52,7 +52,7 @@ NEWS_COMMAND = {
         },
         {
             "name": "count",
-            "description": "Number of recent reports to return (default 5)",
+            "description": "Number of recent reports to return (default 3)",
             "type": 4,
             "required": False,
             "min_value": 1,
@@ -60,7 +60,7 @@ NEWS_COMMAND = {
         },
         {
             "name": "detail",
-            "description": "How much stored report text to display",
+            "description": "Display headlines, summaries, or full text (default headlines)",
             "type": 3,
             "required": False,
             "choices": [

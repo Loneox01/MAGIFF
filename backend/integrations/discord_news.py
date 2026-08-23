@@ -47,7 +47,7 @@ def extract_news_query(payload: dict[str, Any]) -> NewsQuery:
     count = options.get("count", DEFAULT_NEWS_COUNT)
     if isinstance(count, bool) or not isinstance(count, int):
         raise ValueError("count must be an integer between 1 and 10")
-    detail_value = options.get("detail", NewsDetail.SUMMARY.value)
+    detail_value = options.get("detail", NewsDetail.HEADLINES.value)
     if not isinstance(detail_value, str):
         raise ValueError("detail must be headlines, summary, or full")
     try:
@@ -222,7 +222,7 @@ def _format_punt(result: NewsResult) -> str:
         return (
             "## No matching news\n"
             f"No active stored reports matched **{scope}**.\n\n"
-            "Try removing one filter or run `/news count:5` to inspect the latest "
+            "Try removing one filter or run `/news count:3` to inspect the latest "
             "unfiltered reports."
         )
     raise ValueError(f"Unsupported news outcome: {result.outcome}")
