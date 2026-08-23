@@ -114,6 +114,22 @@ def split_discord_message(
     return pieces
 
 
+def format_discord_question(prompt: str) -> str:
+    """Render user text as a Discord blockquote without enabling mentions."""
+    lines = prompt.strip().splitlines() or [prompt.strip()]
+    quoted = "\n".join(f"> {line}" if line else ">" for line in lines)
+    return f"**Question**\n{quoted}"
+
+
+def format_discord_thinking(prompt: str) -> str:
+    return f"{format_discord_question(prompt)}\n\n*MAGIFF is thinking…*"
+
+
+def format_discord_answer(prompt: str, answer: str) -> str:
+    normalized_answer = answer.strip() or "MAGIFF returned an empty response."
+    return f"{format_discord_question(prompt)}\n\n**MAGIFF**\n{normalized_answer}"
+
+
 def extract_ask_prompt(payload: dict[str, Any]) -> str | None:
     data = payload.get("data")
     if not isinstance(data, dict) or data.get("name") != "ask":
@@ -205,7 +221,9 @@ class DiscordInteractionRunner:
     def complete(self, completion: DiscordCompletion) -> None:
         try:
             result = self.agent_service.run(completion.prompt)
-            messages = split_discord_message(result.answer)
+            messages = split_discord_message(
+                format_discord_answer(completion.prompt, result.answer)
+            )
             self.webhook_client.edit_original(
                 application_id=self.application_id,
                 interaction_token=completion.interaction_token,
@@ -244,9 +262,12 @@ class DiscordInteractionRunner:
                 self.webhook_client.edit_original(
                     application_id=self.application_id,
                     interaction_token=completion.interaction_token,
-                    content=(
-                        "MAGIFF couldn't complete that request. Please try again "
-                        f"later. Request ID: `{completion.request_id}`"
+                    content=format_discord_answer(
+                        completion.prompt,
+                        (
+                            "I couldn't complete that request. Please try again "
+                            f"later. Request ID: `{completion.request_id}`"
+                        ),
                     ),
                 )
             except Exception:

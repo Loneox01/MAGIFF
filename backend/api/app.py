@@ -24,7 +24,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from integrations.discord import (
     APPLICATION_COMMAND_INTERACTION,
     CHANNEL_MESSAGE_RESPONSE,
-    DEFERRED_CHANNEL_MESSAGE_RESPONSE,
     EPHEMERAL_MESSAGE_FLAG,
     PING_INTERACTION,
     PONG_RESPONSE,
@@ -34,6 +33,7 @@ from integrations.discord import (
     DiscordWebhookClient,
     RecentInteractionIds,
     extract_ask_prompt,
+    format_discord_thinking,
 )
 from services.agent import AgentService
 
@@ -289,7 +289,15 @@ def create_app(
                 interaction_id,
             )
 
-        return JSONResponse({"type": DEFERRED_CHANNEL_MESSAGE_RESPONSE})
+        return JSONResponse(
+            {
+                "type": CHANNEL_MESSAGE_RESPONSE,
+                "data": {
+                    "content": format_discord_thinking(prompt),
+                    "allowed_mentions": {"parse": []},
+                },
+            }
+        )
 
     return app
 

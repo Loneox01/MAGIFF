@@ -86,8 +86,9 @@ real user authentication before exposing the query endpoint to untrusted users.
 
 Discord calls `POST /v1/discord/interactions` directly. That route does not use
 `MAGIFF_API_KEY`; it verifies Discord's Ed25519 request signature, restricts
-commands to `DISCORD_GUILD_ID`, immediately defers the response, and edits the
-deferred message after MAGIFF finishes. The command is `/ask question:...`.
+commands to `DISCORD_GUILD_ID`, immediately shows the quoted question and a
+thinking indicator, and edits that message after MAGIFF finishes. The command
+is `/ask question:...`.
 
 Add these runtime variables to Render alongside the existing API variables:
 

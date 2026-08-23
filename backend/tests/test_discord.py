@@ -132,16 +132,27 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"type": 1})
 
-    def test_defers_command_then_edits_original_response(self) -> None:
+    def test_shows_question_then_edits_original_response(self) -> None:
         response = self.signed_post(self.command_payload())
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"type": 5})
+        self.assertEqual(response.json()["type"], 4)
+        self.assertEqual(
+            response.json()["data"]["content"],
+            "**Question**\n> Who should I start?\n\n*MAGIFF is thinking…*",
+        )
+        self.assertEqual(
+            response.json()["data"]["allowed_mentions"],
+            {"parse": []},
+        )
         self.assertEqual(self.agent.prompts, ["Who should I start?"])
         self.assertEqual(len(self.webhook.edits), 1)
         self.assertEqual(
             self.webhook.edits[0]["content"],
-            "Discord test answer.",
+            (
+                "**Question**\n> Who should I start?\n\n"
+                "**MAGIFF**\nDiscord test answer."
+            ),
         )
         self.assertEqual(self.webhook.followups, [])
 
@@ -162,8 +173,8 @@ class DiscordTests(unittest.TestCase):
         first = self.signed_post(payload)
         second = self.signed_post(payload)
 
-        self.assertEqual(first.json(), {"type": 5})
-        self.assertEqual(second.json(), {"type": 5})
+        self.assertEqual(first.json()["type"], 4)
+        self.assertEqual(second.json()["type"], 4)
         self.assertEqual(self.agent.prompts, ["Who should I start?"])
 
     def test_long_answers_are_split_with_a_bounded_message_count(self) -> None:
