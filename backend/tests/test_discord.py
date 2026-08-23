@@ -10,7 +10,21 @@ from fastapi.testclient import TestClient
 from api.app import create_app
 from api.config import ApiSettings
 from integrations.discord import RecentInteractionIds, split_discord_message
-from jobs.register_discord_commands import register_guild_command
+from integrations.discord_news import (
+    DiscordNewsRunner,
+    NewsCompletion,
+    extract_news_query,
+    format_news_result,
+)
+from jobs.register_discord_commands import NEWS_COMMAND, register_guild_command
+from services.news import (
+    NewsDetail,
+    NewsOutcome,
+    NewsQuery,
+    NewsReport,
+    NewsResult,
+    PlayerCandidate,
+)
 
 
 APPLICATION_ID = "123456789012345678"
@@ -49,6 +63,46 @@ class FakeDiscordWebhookClient:
         self.followups.append(values)
 
 
+class FakeNewsService:
+    def __init__(self) -> None:
+        self.queries: list[NewsQuery] = []
+
+    def latest(self, query: NewsQuery) -> NewsResult:
+        self.queries.append(query)
+        return NewsResult(
+            outcome=NewsOutcome.SUCCESS,
+            query=query,
+            resolved_player=(
+                PlayerCandidate(
+                    "gainwell-id", "Kenny Gainwell", "RB", "TB", "ACT"
+                )
+                if query.player
+                else None
+            ),
+            reports=(
+                NewsReport(
+                    report_id="report-1",
+                    title="Gainwell role update",
+                    source="FantasyPros",
+                    source_url="https://example.com/report-1",
+                    author=None,
+                    published_at="2026-08-23T12:00:00+00:00",
+                    players=("Kenny Gainwell",),
+                    teams=("TB",),
+                    document_type="role_update",
+                    storyline=None,
+                    content_mode="provider_news",
+                    body="Gainwell worked with the first-team offense.",
+                ),
+            ),
+        )
+
+
+class FailingNewsService:
+    def latest(self, query: NewsQuery) -> NewsResult:
+        raise RuntimeError("database unavailable")
+
+
 class DiscordTests(unittest.TestCase):
     def setUp(self) -> None:
         self.private_key = Ed25519PrivateKey.generate()
@@ -68,11 +122,13 @@ class DiscordTests(unittest.TestCase):
             discord_guild_id=GUILD_ID,
         )
         self.agent = FakeAgentService()
+        self.news = FakeNewsService()
         self.webhook = FakeDiscordWebhookClient()
         self.client = TestClient(
             create_app(
                 settings=settings,
                 agent_service=self.agent,
+                news_service=self.news,
                 discord_webhook_client=self.webhook,
                 discord_interaction_ids=RecentInteractionIds(),
             )
@@ -109,6 +165,23 @@ class DiscordTests(unittest.TestCase):
                         "type": 3,
                         "value": "Who should I start?",
                     }
+                ],
+            },
+        }
+
+    def news_payload(self, *, interaction_id: str = "news-interaction") -> dict:
+        return {
+            "id": interaction_id,
+            "application_id": APPLICATION_ID,
+            "guild_id": GUILD_ID,
+            "token": "news-interaction-token",
+            "type": 2,
+            "data": {
+                "name": "news",
+                "options": [
+                    {"name": "player", "type": 3, "value": "Kenny Gainwell"},
+                    {"name": "count", "type": 4, "value": 3},
+                    {"name": "detail", "type": 3, "value": "summary"},
                 ],
             },
         }
@@ -177,6 +250,80 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(second.json()["type"], 4)
         self.assertEqual(self.agent.prompts, ["Who should I start?"])
 
+    def test_news_uses_slash_options_and_edits_original_response(self) -> None:
+        response = self.signed_post(self.news_payload())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["type"], 4)
+        self.assertIn("latest 3", response.json()["data"]["content"])
+        self.assertEqual(len(self.news.queries), 1)
+        self.assertEqual(self.news.queries[0].player, "Kenny Gainwell")
+        self.assertEqual(self.news.queries[0].count, 3)
+        self.assertEqual(self.news.queries[0].detail, NewsDetail.SUMMARY)
+        self.assertEqual(len(self.webhook.edits), 1)
+        self.assertIn("Gainwell role update", self.webhook.edits[0]["content"])
+        self.assertIn(
+            "Gainwell worked with the first-team offense",
+            self.webhook.edits[0]["content"],
+        )
+
+    def test_news_rejects_invalid_options_without_querying_service(self) -> None:
+        payload = self.news_payload()
+        payload["data"]["options"] = [
+            {"name": "detail", "type": 3, "value": "everything"}
+        ]
+
+        response = self.signed_post(payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("headlines, summary, or full", response.json()["data"]["content"])
+        self.assertEqual(self.news.queries, [])
+
+    def test_news_parser_defaults_are_bounded(self) -> None:
+        payload = self.news_payload()
+        payload["data"]["options"] = []
+
+        query = extract_news_query(payload)
+
+        self.assertEqual(query, NewsQuery())
+
+    def test_news_ambiguity_format_explains_retry(self) -> None:
+        query = NewsQuery(player="Justin Jefferson")
+        message = format_news_result(
+            NewsResult(
+                outcome=NewsOutcome.PLAYER_AMBIGUOUS,
+                query=query,
+                player_candidates=(
+                    PlayerCandidate("one", "Justin Jefferson", "WR", "MIN", "ACT"),
+                    PlayerCandidate("two", "Justin Jefferson", "DB", "ATL", "ACT"),
+                ),
+            )
+        )
+
+        self.assertIn("matched multiple", message)
+        self.assertIn("team:MIN", message)
+
+    def test_news_failure_punts_with_retry_and_request_id(self) -> None:
+        runner = DiscordNewsRunner(
+            application_id=APPLICATION_ID,
+            news_service=FailingNewsService(),
+            webhook_client=self.webhook,
+        )
+
+        with self.assertLogs("integrations.discord_news", level="ERROR"):
+            runner.complete(
+                NewsCompletion(
+                    interaction_id="failed-news",
+                    interaction_token="failed-token",
+                    query=NewsQuery(),
+                    request_id="request-123",
+                )
+            )
+
+        self.assertEqual(len(self.webhook.edits), 1)
+        self.assertIn("Retry in a moment", self.webhook.edits[0]["content"])
+        self.assertIn("request-123", self.webhook.edits[0]["content"])
+
     def test_long_answers_are_split_with_a_bounded_message_count(self) -> None:
         messages = split_discord_message("word " * 5_000)
 
@@ -223,6 +370,31 @@ class DiscordCommandRegistrationTests(unittest.TestCase):
         self.assertEqual(captured["payload"]["name"], "ask")
         self.assertEqual(captured["payload"]["options"][0]["name"], "question")
         self.assertIn(f"/guilds/{GUILD_ID}/commands", captured["url"])
+
+    def test_registers_news_command_with_structured_options(self) -> None:
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["payload"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={"id": "news-id", "name": "news", "version": "1"},
+            )
+
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            result = register_guild_command(
+                application_id=APPLICATION_ID,
+                guild_id=GUILD_ID,
+                bot_token="private-bot-token",
+                command=NEWS_COMMAND,
+                client=client,
+            )
+
+        self.assertEqual(result["name"], "news")
+        option_names = {
+            option["name"] for option in captured["payload"]["options"]
+        }
+        self.assertEqual(option_names, {"player", "team", "count", "detail"})
 
 
 if __name__ == "__main__":

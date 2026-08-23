@@ -35,7 +35,14 @@ from integrations.discord import (
     extract_ask_prompt,
     format_discord_thinking,
 )
+from integrations.discord_news import (
+    DiscordNewsRunner,
+    NewsCompletion,
+    extract_news_query,
+    format_news_pending,
+)
 from services.agent import AgentService
+from services.news import NewsService
 
 from .config import ApiSettings
 from .schemas import (
@@ -54,6 +61,7 @@ def create_app(
     *,
     settings: ApiSettings | None = None,
     agent_service: AgentService | None = None,
+    news_service: NewsService | None = None,
     discord_webhook_client: DiscordWebhookClient | None = None,
     discord_interaction_ids: RecentInteractionIds | None = None,
 ) -> FastAPI:
@@ -62,6 +70,7 @@ def create_app(
     service = agent_service or AgentService(model=api_settings.agent_model)
     discord_verifier = None
     discord_runner = None
+    discord_news_runner = None
     interaction_ids = discord_interaction_ids or RecentInteractionIds()
     if api_settings.discord_configured:
         discord_verifier = DiscordRequestVerifier(
@@ -70,6 +79,11 @@ def create_app(
         discord_runner = DiscordInteractionRunner(
             application_id=api_settings.discord_application_id or "",
             agent_service=service,
+            webhook_client=discord_webhook_client,
+        )
+        discord_news_runner = DiscordNewsRunner(
+            application_id=api_settings.discord_application_id or "",
+            news_service=news_service or NewsService(),
             webhook_client=discord_webhook_client,
         )
 
@@ -259,12 +273,6 @@ def create_app(
                 discord_message("MAGIFF is private to its configured server.")
             )
 
-        prompt = extract_ask_prompt(payload)
-        if prompt is None:
-            return JSONResponse(
-                discord_message("Use `/ask question:<your question>`.")
-            )
-
         interaction_id = str(payload.get("id", "")).strip()
         interaction_token = str(payload.get("token", "")).strip()
         if not interaction_id or not interaction_token:
@@ -273,27 +281,57 @@ def create_app(
                 detail="Discord interaction ID and token are required",
             )
 
-        if interaction_ids.claim(interaction_id):
-            background_tasks.add_task(
-                discord_runner.complete,
-                DiscordCompletion(
-                    interaction_id=interaction_id,
-                    interaction_token=interaction_token,
-                    prompt=prompt,
-                    request_id=request.state.request_id,
-                ),
-            )
+        data = payload.get("data")
+        command_name = data.get("name") if isinstance(data, dict) else None
+        claimed = interaction_ids.claim(interaction_id)
+        if command_name == "ask":
+            prompt = extract_ask_prompt(payload)
+            if prompt is None:
+                return JSONResponse(
+                    discord_message("Use `/ask question:<your question>`.")
+                )
+            if claimed:
+                background_tasks.add_task(
+                    discord_runner.complete,
+                    DiscordCompletion(
+                        interaction_id=interaction_id,
+                        interaction_token=interaction_token,
+                        prompt=prompt,
+                        request_id=request.state.request_id,
+                    ),
+                )
+            content = format_discord_thinking(prompt)
+        elif command_name == "news" and discord_news_runner is not None:
+            try:
+                news_query = extract_news_query(payload)
+            except ValueError as error:
+                return JSONResponse(discord_message(str(error)))
+            if claimed:
+                background_tasks.add_task(
+                    discord_news_runner.complete,
+                    NewsCompletion(
+                        interaction_id=interaction_id,
+                        interaction_token=interaction_token,
+                        query=news_query,
+                        request_id=request.state.request_id,
+                    ),
+                )
+            content = format_news_pending(news_query)
         else:
+            return JSONResponse(
+                discord_message("Supported commands are `/ask` and `/news`.")
+            )
+
+        if not claimed:
             LOGGER.info(
                 "Ignored duplicate Discord interaction interaction_id=%s",
                 interaction_id,
             )
-
         return JSONResponse(
             {
                 "type": CHANNEL_MESSAGE_RESPONSE,
                 "data": {
-                    "content": format_discord_thinking(prompt),
+                    "content": content,
                     "allowed_mentions": {"parse": []},
                 },
             }

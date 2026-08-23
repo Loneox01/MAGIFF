@@ -29,12 +29,58 @@ ASK_COMMAND = {
     ],
 }
 
+NEWS_COMMAND = {
+    "name": "news",
+    "type": 1,
+    "description": "Get the latest reports stored by MAGIFF",
+    "options": [
+        {
+            "name": "player",
+            "description": "Optional full or partial player name",
+            "type": 3,
+            "required": False,
+            "min_length": 1,
+            "max_length": 100,
+        },
+        {
+            "name": "team",
+            "description": "Optional team abbreviation or official name",
+            "type": 3,
+            "required": False,
+            "min_length": 2,
+            "max_length": 40,
+        },
+        {
+            "name": "count",
+            "description": "Number of recent reports to return (default 5)",
+            "type": 4,
+            "required": False,
+            "min_value": 1,
+            "max_value": 10,
+        },
+        {
+            "name": "detail",
+            "description": "How much stored report text to display",
+            "type": 3,
+            "required": False,
+            "choices": [
+                {"name": "Headlines", "value": "headlines"},
+                {"name": "Summaries", "value": "summary"},
+                {"name": "Full stored text", "value": "full"},
+            ],
+        },
+    ],
+}
+
+DISCORD_COMMANDS = (ASK_COMMAND, NEWS_COMMAND)
+
 
 def register_guild_command(
     *,
     application_id: str,
     guild_id: str,
     bot_token: str,
+    command: dict[str, object] = ASK_COMMAND,
     client: httpx.Client | None = None,
 ) -> dict[str, object]:
     if not application_id.isdigit() or not guild_id.isdigit():
@@ -48,7 +94,7 @@ def register_guild_command(
             f"{guild_id}/commands"
         ),
         headers={"Authorization": f"Bot {bot_token}"},
-        json=ASK_COMMAND,
+        json=command,
     )
     try:
         response.raise_for_status()
@@ -81,19 +127,28 @@ def main() -> None:
     if missing:
         raise RuntimeError("Missing Discord configuration: " + ", ".join(missing))
 
-    command = register_guild_command(
-        application_id=application_id,
-        guild_id=guild_id,
-        bot_token=bot_token,
-    )
+    commands = [
+        register_guild_command(
+            application_id=application_id,
+            guild_id=guild_id,
+            bot_token=bot_token,
+            command=command,
+        )
+        for command in DISCORD_COMMANDS
+    ]
     print(
         json.dumps(
             {
                 "status": "registered",
                 "guild_id": guild_id,
-                "command_id": command.get("id"),
-                "command_name": command.get("name"),
-                "version": command.get("version"),
+                "commands": [
+                    {
+                        "command_id": command.get("id"),
+                        "command_name": command.get("name"),
+                        "version": command.get("version"),
+                    }
+                    for command in commands
+                ],
             },
             indent=2,
         )
