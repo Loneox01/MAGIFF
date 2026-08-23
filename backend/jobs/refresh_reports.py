@@ -16,7 +16,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,11 +54,13 @@ FetchFunction = Callable[..., dict[str, Any]]
 @dataclass(frozen=True)
 class FeedDiff:
     received: int
+    eligible: int
     valid: int
     new_items: list[dict[str, Any]]
     changed_items: list[dict[str, Any]]
     unchanged_items: list[dict[str, Any]]
     invalid_items: int
+    date_filtered_items: int
     oldest_published_at: str | None
     newest_published_at: str | None
     feed_window_saturated: bool
@@ -78,6 +80,8 @@ class RefreshResult:
     requests_used_last_24_hours: int
     daily_request_budget: int
     provider_items_received: int
+    eligible_reports: int
+    date_filtered_reports: int
     new_reports: int
     changed_reports: int
     unchanged_reports: int
@@ -109,6 +113,37 @@ def _published_at(item: dict[str, Any]) -> datetime | None:
         return None
 
 
+def _filter_payload_by_date(
+    payload: dict[str, Any],
+    *,
+    published_from: date | None,
+    published_to: date | None,
+) -> tuple[dict[str, Any], int, int]:
+    """Return an inclusive publication-date slice and source row counts."""
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        raise ValueError("FantasyPros response did not contain an items list")
+    if published_from is None and published_to is None:
+        return payload, len(raw_items), 0
+
+    eligible: list[object] = []
+    excluded = 0
+    for item in raw_items:
+        published = _published_at(item) if isinstance(item, dict) else None
+        if published is None:
+            excluded += 1
+            continue
+        published_date = published.date()
+        if published_from is not None and published_date < published_from:
+            excluded += 1
+            continue
+        if published_to is not None and published_date > published_to:
+            excluded += 1
+            continue
+        eligible.append(item)
+    return {**payload, "items": eligible}, len(raw_items), excluded
+
+
 def _existing_hashes(
     client: Client,
     external_ids: list[str],
@@ -136,6 +171,8 @@ def classify_feed(
     existing_hashes: dict[str, str],
     *,
     requested_limit: int,
+    source_received: int | None = None,
+    date_filtered_items: int = 0,
 ) -> FeedDiff:
     """Classify one provider page before model or embedding work."""
     raw_items = payload.get("items")
@@ -173,18 +210,23 @@ def classify_feed(
     publication_times = [
         value for item in valid if (value := _published_at(item)) is not None
     ]
-    saturated = len(raw_items) >= requested_limit
+    provider_received = (
+        len(raw_items) if source_received is None else source_received
+    )
+    saturated = provider_received >= requested_limit
     # If every item in a full provider window is unseen/changed, more new items
     # may sit beyond the page boundary. Telemetry flags this rather than making
     # an unbudgeted pagination request.
     possible_gap = saturated and bool(valid) and not unchanged_items
     return FeedDiff(
-        received=len(raw_items),
+        received=provider_received,
+        eligible=len(raw_items),
         valid=len(valid),
         new_items=new_items,
         changed_items=changed_items,
         unchanged_items=unchanged_items,
         invalid_items=invalid,
+        date_filtered_items=date_filtered_items,
         oldest_published_at=(
             min(publication_times).isoformat() if publication_times else None
         ),
@@ -258,9 +300,13 @@ def _metrics(
     diff: FeedDiff | None,
     processing: ProcessingResult | None,
     loading: ReportLoadResult | None,
+    extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
+        **(extra or {}),
         "provider_items_received": diff.received if diff else 0,
+        "eligible_reports": diff.eligible if diff else 0,
+        "date_filtered_reports": diff.date_filtered_items if diff else 0,
         "new_reports": len(diff.new_items) if diff else 0,
         "changed_reports": len(diff.changed_items) if diff else 0,
         "unchanged_reports": len(diff.unchanged_items) if diff else 0,
@@ -296,6 +342,9 @@ def refresh_reports(
     daily_request_budget: int = DEFAULT_DAILY_REQUEST_BUDGET,
     trigger: str = "manual",
     category: str | None = None,
+    fpid: str | int | None = None,
+    published_from: date | None = None,
+    published_to: date | None = None,
     metadata_model: str = "gpt-5.6-luna",
     metadata_batch_size: int = DEFAULT_BATCH_SIZE,
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
@@ -305,6 +354,8 @@ def refresh_reports(
     client: Client | None = None,
     openai_client: OpenAI | None = None,
     fetcher: FetchFunction = fetch_news,
+    run_metadata: dict[str, object] | None = None,
+    emit_result: bool = True,
 ) -> RefreshResult:
     if report_limit < 1:
         raise ValueError("report_limit must be positive")
@@ -316,6 +367,8 @@ def refresh_reports(
         raise ValueError("metadata_batch_size must be positive")
     if lease_seconds < 60 or lease_seconds > 3600:
         raise ValueError("lease_seconds must be between 60 and 3600")
+    if published_from and published_to and published_to < published_from:
+        raise ValueError("published_to cannot be earlier than published_from")
 
     supabase_client = client or get_supabase_client()
     reservation = _reserve_run(
@@ -338,6 +391,8 @@ def refresh_reports(
             requests_used_last_24_hours=requests_used_last_24_hours,
             daily_request_budget=daily_request_budget,
             provider_items_received=0,
+            eligible_reports=0,
+            date_filtered_reports=0,
             new_reports=0,
             changed_reports=0,
             unchanged_reports=0,
@@ -352,7 +407,8 @@ def refresh_reports(
             feed_window_saturated=False,
             possible_coverage_gap=False,
         )
-        print(json.dumps(asdict(result), indent=2))
+        if emit_result:
+            print(json.dumps(asdict(result), indent=2))
         return result
 
     diff: FeedDiff | None = None
@@ -361,7 +417,18 @@ def refresh_reports(
     try:
         # Deliberately no automatic provider retry: every attempt can consume
         # FantasyPros quota and must first receive its own ledger reservation.
-        payload = fetcher(api_key, limit=report_limit, category=category)
+        payload = fetcher(
+            api_key,
+            limit=report_limit,
+            category=category,
+            fpid=fpid,
+            order_by="created",
+        )
+        payload, source_received, date_filtered_items = _filter_payload_by_date(
+            payload,
+            published_from=published_from,
+            published_to=published_to,
+        )
         raw_items = payload.get("items")
         if not isinstance(raw_items, list):
             raise ValueError("FantasyPros response did not contain an items list")
@@ -375,6 +442,8 @@ def refresh_reports(
             payload,
             existing,
             requested_limit=report_limit,
+            source_received=source_received,
+            date_filtered_items=date_filtered_items,
         )
         fetched_at = datetime.now(UTC)
         _mark_existing_reports_seen(
@@ -426,7 +495,16 @@ def refresh_reports(
                         log_path=root / "load_latest_run.json",
                     )
 
-        metrics = _metrics(diff, processing, loading)
+        request_metadata = {
+            **(run_metadata or {}),
+            "request_category": category,
+            "request_fpid": None if fpid is None else str(fpid),
+            "published_from": (
+                published_from.isoformat() if published_from else None
+            ),
+            "published_to": published_to.isoformat() if published_to else None,
+        }
+        metrics = _metrics(diff, processing, loading, request_metadata)
         status = "partial" if int(metrics["failed_reports"]) else "succeeded"
         _finish_run(
             supabase_client,
@@ -442,6 +520,8 @@ def refresh_reports(
             requests_used_last_24_hours=requests_used_last_24_hours,
             daily_request_budget=daily_request_budget,
             provider_items_received=int(metrics["provider_items_received"]),
+            eligible_reports=int(metrics["eligible_reports"]),
+            date_filtered_reports=int(metrics["date_filtered_reports"]),
             new_reports=int(metrics["new_reports"]),
             changed_reports=int(metrics["changed_reports"]),
             unchanged_reports=int(metrics["unchanged_reports"]),
@@ -458,10 +538,24 @@ def refresh_reports(
             feed_window_saturated=diff.feed_window_saturated,
             possible_coverage_gap=diff.possible_coverage_gap,
         )
-        print(json.dumps(asdict(result), indent=2))
+        if emit_result:
+            print(json.dumps(asdict(result), indent=2))
         return result
     except Exception as error:
-        failure_metrics = _metrics(diff, processing, loading)
+        failure_metrics = _metrics(
+            diff,
+            processing,
+            loading,
+            {
+                **(run_metadata or {}),
+                "request_category": category,
+                "request_fpid": None if fpid is None else str(fpid),
+                "published_from": (
+                    published_from.isoformat() if published_from else None
+                ),
+                "published_to": published_to.isoformat() if published_to else None,
+            },
+        )
         try:
             _finish_run(
                 supabase_client,
@@ -488,6 +582,17 @@ def main() -> None:
         "--category",
         choices=["injury", "recap", "transaction", "rumor", "breaking"],
     )
+    parser.add_argument("--fpid", help="Filter by FantasyPros player ID.")
+    parser.add_argument(
+        "--published-from",
+        type=date.fromisoformat,
+        help="Keep reports published on or after YYYY-MM-DD.",
+    )
+    parser.add_argument(
+        "--published-to",
+        type=date.fromisoformat,
+        help="Keep reports published on or before YYYY-MM-DD.",
+    )
     parser.add_argument("--metadata-batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
     parser.add_argument(
@@ -509,6 +614,9 @@ def main() -> None:
         daily_request_budget=args.daily_request_budget,
         trigger=args.trigger,
         category=args.category,
+        fpid=args.fpid,
+        published_from=args.published_from,
+        published_to=args.published_to,
         metadata_model=metadata_model,
         metadata_batch_size=args.metadata_batch_size,
         embedding_model=args.embedding_model,

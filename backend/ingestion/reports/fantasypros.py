@@ -27,6 +27,7 @@ DEFAULT_OUTPUT_DIR = (
 )
 NEWS_URL = "https://api.fantasypros.com/public/v2/json/nfl/news"
 ALLOWED_CATEGORIES = {"injury", "recap", "transaction", "rumor", "breaking"}
+ALLOWED_ORDER_FIELDS = {"created", "updated"}
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,8 @@ def fetch_news(
     *,
     limit: int = 25,
     category: str | None = None,
+    fpid: str | int | None = None,
+    order_by: str = "created",
     timeout_seconds: float = 30,
 ) -> dict[str, Any]:
     """Fetch one FantasyPros NFL news response."""
@@ -81,10 +84,17 @@ def fetch_news(
     if category is not None and category not in ALLOWED_CATEGORIES:
         allowed = ", ".join(sorted(ALLOWED_CATEGORIES))
         raise ValueError(f"category must be one of: {allowed}")
+    if fpid is not None and (not str(fpid).isdigit() or int(fpid) < 1):
+        raise ValueError("fpid must be a positive FantasyPros player ID")
+    if order_by not in ALLOWED_ORDER_FIELDS:
+        allowed = ", ".join(sorted(ALLOWED_ORDER_FIELDS))
+        raise ValueError(f"order_by must be one of: {allowed}")
 
-    params: dict[str, object] = {"limit": limit}
+    params: dict[str, object] = {"limit": limit, "order_by": order_by}
     if category is not None:
         params["category"] = category
+    if fpid is not None:
+        params["fpid"] = str(fpid)
 
     response = httpx.get(
         NEWS_URL,
@@ -205,6 +215,12 @@ def main() -> None:
     )
     parser.add_argument("--limit", type=int, default=25)
     parser.add_argument("--category", choices=sorted(ALLOWED_CATEGORIES))
+    parser.add_argument("--fpid", help="Filter news by FantasyPros player ID.")
+    parser.add_argument(
+        "--order-by",
+        choices=sorted(ALLOWED_ORDER_FIELDS),
+        default="created",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -230,6 +246,8 @@ def main() -> None:
             api_key,
             limit=args.limit,
             category=args.category,
+            fpid=args.fpid,
+            order_by=args.order_by,
         )
 
     result = ingest_payload(

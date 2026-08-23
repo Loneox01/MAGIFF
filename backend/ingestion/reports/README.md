@@ -67,3 +67,54 @@ The two feed-window flags help tune the per-call report count later:
 Required GitHub repository secrets are `FANTASYPROS_API_KEY`, `OPENAI_API_KEY`,
 `SUPABASE_URL`, and `SUPABASE_SECRET_KEY`. The secret Supabase key is used only
 inside the backend job and must never be exposed to Vercel/browser code.
+
+## One-time historical backfill
+
+The news endpoint has no documented page cursor. The backfill therefore uses
+its supported FantasyPros-player-ID filter and builds a relevance-first queue
+from current ECR, prior-season PPR production, and active QB/RB/WR/TE records.
+It uses the same hashes, metadata processor, embedding loader, ingestion lease,
+and rolling request ledger as the continuous job.
+
+First preview the next chunk. This reads Supabase state but does not call
+FantasyPros or OpenAI:
+
+```bash
+python -m jobs.backfill_reports \
+  --from 2026-01-01 \
+  --target-reports 200 \
+  --max-requests 2 \
+  --plan
+```
+
+For the first live test, make one provider request:
+
+```bash
+python -m jobs.backfill_reports \
+  --from 2026-01-01 \
+  --target-reports 200 \
+  --max-requests 1
+```
+
+If that output looks right, subsequent invocations can use the default bounded
+two-request chunk:
+
+```bash
+python -m jobs.backfill_reports \
+  --from 2026-01-01 \
+  --target-reports 200 \
+  --max-requests 2
+```
+
+Successful player feeds are recorded in `report_ingestion_runs.metadata` and
+skipped on later invocations. Partial feeds remain eligible for retry. The
+target counts only reports newly added by this backfill, and database report
+IDs still deduplicate anything the hourly feed already captured. A manual run
+automatically pauses when the shared 40-request rolling budget or ingestion
+lease prevents another call.
+
+Each player request asks for up to 100 reports and then applies the inclusive
+publication cutoff locally. If `possible_coverage_gap=true`, the provider filled
+that player's entire exposed window, so older news may remain inaccessible
+without a documented cursor. This is telemetry, not permission to make an
+unbounded retry loop.

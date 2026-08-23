@@ -1,5 +1,6 @@
 import json
 import unittest
+from datetime import date
 from types import SimpleNamespace
 
 from ingestion.reports.fantasypros import content_hash
@@ -185,6 +186,42 @@ class ReportRefreshTests(unittest.TestCase):
             ["reserve_report_ingestion_run", "finish_report_ingestion_run"],
         )
         self.assertEqual(len(client.updates), 1)
+
+    def test_backfill_date_bounds_filter_before_model_work(self) -> None:
+        old = report_item(1)
+        old["created"] = "2025-12-31 23:59:59"
+        eligible = report_item(2)
+        eligible["created"] = "2026-01-01 00:00:00"
+        future = report_item(3)
+        future["created"] = "2026-08-23 00:00:00"
+        client = FakeClient(
+            {
+                "reports": [
+                    {
+                        "provider": "fantasypros",
+                        "external_id": "2",
+                        "source_content_hash": content_hash(eligible),
+                    }
+                ]
+            }
+        )
+
+        result = refresh_reports(
+            api_key="test-key",
+            report_limit=100,
+            published_from=date(2026, 1, 1),
+            published_to=date(2026, 8, 22),
+            client=client,
+            fetcher=lambda *_args, **_kwargs: {
+                "items": [old, eligible, future]
+            },
+        )
+
+        self.assertEqual(result.provider_items_received, 3)
+        self.assertEqual(result.eligible_reports, 1)
+        self.assertEqual(result.date_filtered_reports, 2)
+        self.assertEqual(result.unchanged_reports, 1)
+        self.assertEqual(result.metadata_input_tokens, 0)
 
     def test_supabase_catalog_batches_provider_ids_and_caches_names(self) -> None:
         client = FakeClient(
