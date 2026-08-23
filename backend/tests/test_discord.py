@@ -139,7 +139,7 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(response.json()["type"], 4)
         self.assertEqual(
             response.json()["data"]["content"],
-            "**Question**\n> Who should I start?\n\n*MAGIFF is thinking…*",
+            "## Question\n> Who should I start?\n\n*MAGIFF is thinking…*",
         )
         self.assertEqual(
             response.json()["data"]["allowed_mentions"],
@@ -150,8 +150,8 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(
             self.webhook.edits[0]["content"],
             (
-                "**Question**\n> Who should I start?\n\n"
-                "**MAGIFF**\nDiscord test answer."
+                "## Question\n> Who should I start?\n\n"
+                "## MAGIFF\nDiscord test answer."
             ),
         )
         self.assertEqual(self.webhook.followups, [])

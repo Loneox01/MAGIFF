@@ -118,7 +118,7 @@ def format_discord_question(prompt: str) -> str:
     """Render user text as a Discord blockquote without enabling mentions."""
     lines = prompt.strip().splitlines() or [prompt.strip()]
     quoted = "\n".join(f"> {line}" if line else ">" for line in lines)
-    return f"**Question**\n{quoted}"
+    return f"## Question\n{quoted}"
 
 
 def format_discord_thinking(prompt: str) -> str:
@@ -127,7 +127,7 @@ def format_discord_thinking(prompt: str) -> str:
 
 def format_discord_answer(prompt: str, answer: str) -> str:
     normalized_answer = answer.strip() or "MAGIFF returned an empty response."
-    return f"{format_discord_question(prompt)}\n\n**MAGIFF**\n{normalized_answer}"
+    return f"{format_discord_question(prompt)}\n\n## MAGIFF\n{normalized_answer}"
 
 
 def extract_ask_prompt(payload: dict[str, Any]) -> str | None:
