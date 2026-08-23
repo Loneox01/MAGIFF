@@ -1,11 +1,13 @@
 # MAGIFF backend
 
-The backend has three independent entry points:
+The backend has four independent entry points:
 
 - `python main.py` runs the interactive terminal agent.
 - `uvicorn api.app:app --reload` runs the HTTP agent API.
 - `python -m jobs.refresh_reports ...` runs report ingestion. Production
   ingestion remains in GitHub Actions and is not started by the API server.
+- `python -m jobs.register_discord_commands` registers the private `/ask`
+  command in one Discord server.
 
 ## Local API
 
@@ -55,12 +57,15 @@ curl -X POST http://127.0.0.1:8000/v1/agent/query \
 
 The repository-root `render.yaml` defines one free Python web service with
 `backend/` as its root directory. Create a Render Blueprint from this repo and
-provide the four prompted secrets:
+provide the prompted runtime values:
 
 - `OPENAI_API_KEY`
 - `SUPABASE_URL`
 - `SUPABASE_SECRET_KEY`
 - `MAGIFF_API_KEY`
+- `DISCORD_APPLICATION_ID`
+- `DISCORD_PUBLIC_KEY`
+- `DISCORD_GUILD_ID`
 
 The OpenAI project key needs Responses write access and Embeddings access
 because report retrieval embeds incoming queries. The FantasyPros key is not
@@ -76,3 +81,45 @@ When a browser frontend is added, set `MAGIFF_CORS_ORIGINS` to its exact origin
 (for example, the Vercel production URL). Never put `MAGIFF_API_KEY` in Vite or
 other browser-visible code. Replace this temporary private bearer token with
 real user authentication before exposing the query endpoint to untrusted users.
+
+## Private Discord command
+
+Discord calls `POST /v1/discord/interactions` directly. That route does not use
+`MAGIFF_API_KEY`; it verifies Discord's Ed25519 request signature, restricts
+commands to `DISCORD_GUILD_ID`, immediately defers the response, and edits the
+deferred message after MAGIFF finishes. The command is `/ask question:...`.
+
+Add these runtime variables to Render alongside the existing API variables:
+
+```text
+DISCORD_APPLICATION_ID=the-application-id-from-General-Information
+DISCORD_PUBLIC_KEY=the-public-key-from-General-Information
+DISCORD_GUILD_ID=the-private-server-id
+```
+
+Keep the bot token only in the project-root local `.env`; it is needed for
+command registration but not by the running interaction endpoint:
+
+```text
+DISCORD_BOT_TOKEN=the-private-bot-token
+```
+
+After Render deploys the Discord code:
+
+1. Open `https://YOUR-RENDER-HOST/health` so the free service is awake.
+2. In Discord's Developer Portal, set the Interactions Endpoint URL to
+   `https://YOUR-RENDER-HOST/v1/discord/interactions` and save it.
+3. From `backend/` with the virtual environment active, run:
+
+   ```bash
+   python -m jobs.register_discord_commands
+   ```
+
+4. Install the application in the configured server if it is not already
+   installed, then run `/ask` there.
+
+The command is registered at guild scope, so changes appear quickly and it is
+not published globally. Render's free service can sleep; a cold start may miss
+Discord's three-second acknowledgement deadline. Wake `/health` before a demo.
+Do not place `DISCORD_BOT_TOKEN`, `MAGIFF_API_KEY`, or any provider secret in
+Discord URLs, source control, or browser code.

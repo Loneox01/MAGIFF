@@ -25,3 +25,9 @@ services:
         sync: false
       - key: MAGIFF_API_KEY
         sync: false
+      - key: DISCORD_APPLICATION_ID
+        sync: false
+      - key: DISCORD_PUBLIC_KEY
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false

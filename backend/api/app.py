@@ -7,12 +7,34 @@ import logging
 import secrets
 import uuid
 from dataclasses import asdict
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from integrations.discord import (
+    APPLICATION_COMMAND_INTERACTION,
+    CHANNEL_MESSAGE_RESPONSE,
+    DEFERRED_CHANNEL_MESSAGE_RESPONSE,
+    EPHEMERAL_MESSAGE_FLAG,
+    PING_INTERACTION,
+    PONG_RESPONSE,
+    DiscordCompletion,
+    DiscordInteractionRunner,
+    DiscordRequestVerifier,
+    DiscordWebhookClient,
+    RecentInteractionIds,
+    extract_ask_prompt,
+)
 from services.agent import AgentService
 
 from .config import ApiSettings
@@ -32,14 +54,28 @@ def create_app(
     *,
     settings: ApiSettings | None = None,
     agent_service: AgentService | None = None,
+    discord_webhook_client: DiscordWebhookClient | None = None,
+    discord_interaction_ids: RecentInteractionIds | None = None,
 ) -> FastAPI:
     api_settings = settings or ApiSettings()
     api_settings.validate_runtime()
     service = agent_service or AgentService(model=api_settings.agent_model)
+    discord_verifier = None
+    discord_runner = None
+    interaction_ids = discord_interaction_ids or RecentInteractionIds()
+    if api_settings.discord_configured:
+        discord_verifier = DiscordRequestVerifier(
+            api_settings.discord_public_key_value or ""
+        )
+        discord_runner = DiscordInteractionRunner(
+            application_id=api_settings.discord_application_id or "",
+            agent_service=service,
+            webhook_client=discord_webhook_client,
+        )
 
     app = FastAPI(
         title="MAGIFF Agent API",
-        version="0.1.0",
+        version="0.2.0",
         description=(
             "Private HTTP transport for the structured-data and report-backed "
             "fantasy-football agent."
@@ -47,6 +83,7 @@ def create_app(
     )
     app.state.settings = api_settings
     app.state.agent_service = service
+    app.state.discord_interaction_ids = interaction_ids
 
     if api_settings.cors_origins:
         app.add_middleware(
@@ -155,6 +192,104 @@ def create_app(
             }
         )
         return response
+
+    def discord_message(content: str) -> dict[str, Any]:
+        return {
+            "type": CHANNEL_MESSAGE_RESPONSE,
+            "data": {
+                "content": content,
+                "flags": EPHEMERAL_MESSAGE_FLAG,
+                "allowed_mentions": {"parse": []},
+            },
+        }
+
+    @app.post("/v1/discord/interactions", tags=["discord"])
+    async def discord_interactions(
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> JSONResponse:
+        """Verify, acknowledge, and asynchronously complete a Discord command."""
+        if discord_verifier is None or discord_runner is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Discord integration is not configured",
+            )
+
+        raw_body = await request.body()
+        if not discord_verifier.verify(
+            signature_hex=request.headers.get("X-Signature-Ed25519"),
+            timestamp=request.headers.get("X-Signature-Timestamp"),
+            body=raw_body,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid Discord request signature",
+            )
+
+        try:
+            payload = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Discord interaction payload",
+            ) from error
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Discord interaction payload",
+            )
+
+        if str(payload.get("application_id", "")) != (
+            api_settings.discord_application_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Discord application ID does not match",
+            )
+
+        interaction_type = payload.get("type")
+        if interaction_type == PING_INTERACTION:
+            return JSONResponse({"type": PONG_RESPONSE})
+        if interaction_type != APPLICATION_COMMAND_INTERACTION:
+            return JSONResponse(
+                discord_message("That Discord interaction is not supported.")
+            )
+        if str(payload.get("guild_id", "")) != api_settings.discord_guild_id:
+            return JSONResponse(
+                discord_message("MAGIFF is private to its configured server.")
+            )
+
+        prompt = extract_ask_prompt(payload)
+        if prompt is None:
+            return JSONResponse(
+                discord_message("Use `/ask question:<your question>`.")
+            )
+
+        interaction_id = str(payload.get("id", "")).strip()
+        interaction_token = str(payload.get("token", "")).strip()
+        if not interaction_id or not interaction_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Discord interaction ID and token are required",
+            )
+
+        if interaction_ids.claim(interaction_id):
+            background_tasks.add_task(
+                discord_runner.complete,
+                DiscordCompletion(
+                    interaction_id=interaction_id,
+                    interaction_token=interaction_token,
+                    prompt=prompt,
+                    request_id=request.state.request_id,
+                ),
+            )
+        else:
+            LOGGER.info(
+                "Ignored duplicate Discord interaction interaction_id=%s",
+                interaction_id,
+            )
+
+        return JSONResponse({"type": DEFERRED_CHANNEL_MESSAGE_RESPONSE})
 
     return app
 
