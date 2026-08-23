@@ -40,7 +40,7 @@ def extract_news_query(payload: dict[str, Any]) -> NewsQuery:
         if not isinstance(item, dict):
             raise ValueError("Discord supplied an invalid /news option")
         name = item.get("name")
-        if name not in {"player", "team", "count", "detail"}:
+        if name not in {"player", "team", "count", "detail", "previews"}:
             raise ValueError(f"Unsupported /news option: {name}")
         options[str(name)] = item.get("value")
 
@@ -57,15 +57,19 @@ def extract_news_query(payload: dict[str, Any]) -> NewsQuery:
 
     player = options.get("player")
     team = options.get("team")
+    previews = options.get("previews", False)
     if player is not None and not isinstance(player, str):
         raise ValueError("player must be a name")
     if team is not None and not isinstance(team, str):
         raise ValueError("team must be an NFL abbreviation or official name")
+    if not isinstance(previews, bool):
+        raise ValueError("previews must be true or false")
     return NewsQuery(
         count=count,
         detail=detail,
         player=player.strip() if player else None,
         team=team.strip() if team else None,
+        previews=previews,
     )
 
 
@@ -75,6 +79,8 @@ def _request_scope(query: NewsQuery) -> str:
         values.append(f"player: {query.player}")
     if query.team:
         values.append(f"team: {query.team}")
+    if query.previews:
+        values.append("previews: on")
     return " · ".join(values)
 
 
@@ -263,12 +269,14 @@ class DiscordNewsRunner:
                 application_id=self.application_id,
                 interaction_token=completion.interaction_token,
                 content=messages[0],
+                suppress_embeds=not completion.query.previews,
             )
             for message in messages[1:]:
                 self.webhook_client.create_followup(
                     application_id=self.application_id,
                     interaction_token=completion.interaction_token,
                     content=message,
+                    suppress_embeds=not completion.query.previews,
                 )
             LOGGER.info(
                 json.dumps(

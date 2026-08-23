@@ -53,13 +53,13 @@ class FakeAgentService:
 
 class FakeDiscordWebhookClient:
     def __init__(self) -> None:
-        self.edits: list[dict[str, str]] = []
-        self.followups: list[dict[str, str]] = []
+        self.edits: list[dict[str, object]] = []
+        self.followups: list[dict[str, object]] = []
 
-    def edit_original(self, **values: str) -> None:
+    def edit_original(self, **values: object) -> None:
         self.edits.append(values)
 
-    def create_followup(self, **values: str) -> None:
+    def create_followup(self, **values: object) -> None:
         self.followups.append(values)
 
 
@@ -255,6 +255,7 @@ class DiscordTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["type"], 4)
+        self.assertEqual(response.json()["data"]["flags"], 4)
         self.assertIn("latest 3", response.json()["data"]["content"])
         self.assertEqual(len(self.news.queries), 1)
         self.assertEqual(self.news.queries[0].player, "Kenny Gainwell")
@@ -266,6 +267,19 @@ class DiscordTests(unittest.TestCase):
             "Gainwell worked with the first-team offense",
             self.webhook.edits[0]["content"],
         )
+        self.assertTrue(self.webhook.edits[0]["suppress_embeds"])
+
+    def test_news_can_enable_link_previews(self) -> None:
+        payload = self.news_payload(interaction_id="preview-news")
+        payload["data"]["options"].append(
+            {"name": "previews", "type": 5, "value": True}
+        )
+
+        response = self.signed_post(payload)
+
+        self.assertNotIn("flags", response.json()["data"])
+        self.assertTrue(self.news.queries[0].previews)
+        self.assertFalse(self.webhook.edits[0]["suppress_embeds"])
 
     def test_news_rejects_invalid_options_without_querying_service(self) -> None:
         payload = self.news_payload()
@@ -394,7 +408,9 @@ class DiscordCommandRegistrationTests(unittest.TestCase):
         option_names = {
             option["name"] for option in captured["payload"]["options"]
         }
-        self.assertEqual(option_names, {"player", "team", "count", "detail"})
+        self.assertEqual(
+            option_names, {"player", "team", "count", "detail", "previews"}
+        )
 
 
 if __name__ == "__main__":

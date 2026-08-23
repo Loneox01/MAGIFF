@@ -30,6 +30,7 @@ planner, embeddings, reranker, or answer model.
 | `team` | No | Team abbreviation or official name | Any team |
 | `count` | No | Integer from 1 through 10 | 3 |
 | `detail` | No | `headlines`, `summary`, or `full` | `headlines` |
+| `previews` | No | `true` or `false` | `false` |
 
 Examples:
 
@@ -39,10 +40,13 @@ Examples:
 /news player:Kenny Gainwell count:3
 /news team:TB detail:summary
 /news player:Kenny Gainwell team:TB count:3 detail:full
+/news player:Michael Penix Jr. previews:true
 ```
 
 Bare `/news` therefore stays compact: it returns only the three newest linked
-headlines and their source/date metadata.
+headlines and their source/date metadata. Headlines remain clickable while
+Discord's large link-preview cards are suppressed. Set `previews:true` to show
+those cards.
 
 `full` means the complete text stored by MAGIFF, which may be a provider news
 blurb rather than the full article at the linked source. Full view is capped at

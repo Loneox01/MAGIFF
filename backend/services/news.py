@@ -40,6 +40,7 @@ class NewsQuery:
     detail: NewsDetail = NewsDetail.HEADLINES
     player: str | None = None
     team: str | None = None
+    previews: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -52,6 +53,8 @@ class NewsQuery:
             )
         if not isinstance(self.detail, NewsDetail):
             raise ValueError("news detail must be headlines, summary, or full")
+        if not isinstance(self.previews, bool):
+            raise ValueError("previews must be true or false")
         if self.player is not None and not self.player.strip():
             raise ValueError("player cannot be blank")
         if self.player is not None and len(self.player) > 100:

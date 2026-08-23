@@ -69,6 +69,12 @@ NEWS_COMMAND = {
                 {"name": "Full stored text", "value": "full"},
             ],
         },
+        {
+            "name": "previews",
+            "description": "Show Discord's large link preview cards (default false)",
+            "type": 5,
+            "required": False,
+        },
     ],
 }
 

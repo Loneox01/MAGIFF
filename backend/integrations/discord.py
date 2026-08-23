@@ -27,6 +27,7 @@ PONG_RESPONSE = 1
 CHANNEL_MESSAGE_RESPONSE = 4
 DEFERRED_CHANNEL_MESSAGE_RESPONSE = 5
 EPHEMERAL_MESSAGE_FLAG = 1 << 6
+SUPPRESS_EMBEDS_MESSAGE_FLAG = 1 << 2
 
 
 class DiscordRequestVerifier:
@@ -160,11 +161,18 @@ class DiscordWebhookClient:
         self.client = client or httpx.Client(timeout=timeout_seconds)
 
     @staticmethod
-    def _message(content: str) -> dict[str, object]:
-        return {
+    def _message(
+        content: str,
+        *,
+        suppress_embeds: bool = False,
+    ) -> dict[str, object]:
+        message: dict[str, object] = {
             "content": content,
             "allowed_mentions": {"parse": []},
         }
+        if suppress_embeds:
+            message["flags"] = SUPPRESS_EMBEDS_MESSAGE_FLAG
+        return message
 
     def edit_original(
         self,
@@ -172,13 +180,14 @@ class DiscordWebhookClient:
         application_id: str,
         interaction_token: str,
         content: str,
+        suppress_embeds: bool = False,
     ) -> None:
         response = self.client.patch(
             (
                 f"{DISCORD_API_BASE}/webhooks/{application_id}/"
                 f"{interaction_token}/messages/@original"
             ),
-            json=self._message(content),
+            json=self._message(content, suppress_embeds=suppress_embeds),
         )
         response.raise_for_status()
 
@@ -188,10 +197,11 @@ class DiscordWebhookClient:
         application_id: str,
         interaction_token: str,
         content: str,
+        suppress_embeds: bool = False,
     ) -> None:
         response = self.client.post(
             f"{DISCORD_API_BASE}/webhooks/{application_id}/{interaction_token}",
-            json=self._message(content),
+            json=self._message(content, suppress_embeds=suppress_embeds),
         )
         response.raise_for_status()
 

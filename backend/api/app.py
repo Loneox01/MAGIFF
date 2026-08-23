@@ -27,6 +27,7 @@ from integrations.discord import (
     EPHEMERAL_MESSAGE_FLAG,
     PING_INTERACTION,
     PONG_RESPONSE,
+    SUPPRESS_EMBEDS_MESSAGE_FLAG,
     DiscordCompletion,
     DiscordInteractionRunner,
     DiscordRequestVerifier,
@@ -284,6 +285,7 @@ def create_app(
         data = payload.get("data")
         command_name = data.get("name") if isinstance(data, dict) else None
         claimed = interaction_ids.claim(interaction_id)
+        suppress_embeds = False
         if command_name == "ask":
             prompt = extract_ask_prompt(payload)
             if prompt is None:
@@ -317,6 +319,7 @@ def create_app(
                     ),
                 )
             content = format_news_pending(news_query)
+            suppress_embeds = not news_query.previews
         else:
             return JSONResponse(
                 discord_message("Supported commands are `/ask` and `/news`.")
@@ -327,14 +330,14 @@ def create_app(
                 "Ignored duplicate Discord interaction interaction_id=%s",
                 interaction_id,
             )
+        response_data: dict[str, Any] = {
+            "content": content,
+            "allowed_mentions": {"parse": []},
+        }
+        if suppress_embeds:
+            response_data["flags"] = SUPPRESS_EMBEDS_MESSAGE_FLAG
         return JSONResponse(
-            {
-                "type": CHANNEL_MESSAGE_RESPONSE,
-                "data": {
-                    "content": content,
-                    "allowed_mentions": {"parse": []},
-                },
-            }
+            {"type": CHANNEL_MESSAGE_RESPONSE, "data": response_data}
         )
 
     return app
