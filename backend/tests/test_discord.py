@@ -23,6 +23,8 @@ from integrations.discord_stats import (
 from jobs.register_discord_commands import (
     NEWS_COMMAND,
     STATS_COMMAND,
+    TEST_COMMANDS,
+    UAI_COMMANDS,
     register_guild_command,
 )
 from services.news import (
@@ -38,6 +40,7 @@ from services.stats import StatsOutcome, StatsResult
 
 APPLICATION_ID = "123456789012345678"
 GUILD_ID = "987654321098765432"
+UAI_GUILD_ID = "876543210987654321"
 
 
 class FakeAgentService:
@@ -152,7 +155,9 @@ class DiscordTests(unittest.TestCase):
             supabase_secret_key="test-supabase-key",
             discord_application_id=APPLICATION_ID,
             discord_public_key=public_key.hex(),
-            discord_guild_id=GUILD_ID,
+            discord_test_guild_id=GUILD_ID,
+            discord_uai_guild_id=UAI_GUILD_ID,
+            discord_uai_enabled=True,
         )
         self.agent = FakeAgentService()
         self.news = FakeNewsService()
@@ -300,6 +305,39 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(response.json()["type"], 4)
         self.assertEqual(response.json()["data"]["flags"], 64)
         self.assertEqual(self.agent.prompts, [])
+
+    def test_uai_profile_allows_news_and_stats(self) -> None:
+        news_payload = self.news_payload(interaction_id="uai-news")
+        news_payload["guild_id"] = UAI_GUILD_ID
+        stats_payload = self.stats_payload(interaction_id="uai-stats")
+        stats_payload["guild_id"] = UAI_GUILD_ID
+
+        news_response = self.signed_post(news_payload)
+        stats_response = self.signed_post(stats_payload)
+
+        self.assertEqual(news_response.json()["type"], 4)
+        self.assertEqual(stats_response.json()["type"], 4)
+        self.assertEqual(len(self.news.queries), 1)
+        self.assertEqual(len(self.stats.queries), 1)
+
+    def test_uai_profile_rejects_ask_even_if_command_remains_visible(self) -> None:
+        payload = self.command_payload(interaction_id="uai-ask")
+        payload["guild_id"] = UAI_GUILD_ID
+
+        response = self.signed_post(payload)
+
+        self.assertIn("only enabled", response.json()["data"]["content"])
+        self.assertEqual(self.agent.prompts, [])
+
+    def test_disabled_uai_profile_rejects_commands(self) -> None:
+        self.client.app.state.settings.discord_uai_enabled = False
+        payload = self.news_payload(interaction_id="disabled-uai-news")
+        payload["guild_id"] = UAI_GUILD_ID
+
+        response = self.signed_post(payload)
+
+        self.assertIn("temporarily disabled", response.json()["data"]["content"])
+        self.assertEqual(self.news.queries, [])
 
     def test_duplicate_interaction_does_not_run_agent_twice(self) -> None:
         payload = self.command_payload(interaction_id="same-interaction")
@@ -480,7 +518,7 @@ class DiscordTests(unittest.TestCase):
             environment="test",
             discord_application_id=APPLICATION_ID,
             discord_public_key=None,
-            discord_guild_id=None,
+            discord_test_guild_id=None,
         )
 
         with self.assertRaisesRegex(RuntimeError, "Discord requires"):
@@ -554,6 +592,16 @@ class DiscordCommandRegistrationTests(unittest.TestCase):
         self.assertTrue(leader_options["formula"]["autocomplete"])
         self.assertTrue(leader_options["minimum_field"]["autocomplete"])
         self.assertNotIn("choices", leader_options["formula"])
+
+    def test_test_and_uai_command_buckets_are_intentionally_different(self) -> None:
+        self.assertEqual(
+            {command["name"] for command in TEST_COMMANDS},
+            {"ask", "news", "stats"},
+        )
+        self.assertEqual(
+            {command["name"] for command in UAI_COMMANDS},
+            {"news", "stats"},
+        )
 
 
 if __name__ == "__main__":

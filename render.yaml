@@ -29,5 +29,9 @@ services:
         sync: false
       - key: DISCORD_PUBLIC_KEY
         sync: false
-      - key: DISCORD_GUILD_ID
+      - key: DISCORD_TEST_GUILD_ID
+        sync: false
+      - key: DISCORD_UAI_GUILD_ID
+        sync: false
+      - key: DISCORD_UAI_ENABLED
         sync: false

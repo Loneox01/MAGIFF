@@ -65,7 +65,9 @@ provide the prompted runtime values:
 - `MAGIFF_API_KEY`
 - `DISCORD_APPLICATION_ID`
 - `DISCORD_PUBLIC_KEY`
-- `DISCORD_GUILD_ID`
+- `DISCORD_TEST_GUILD_ID`
+- `DISCORD_UAI_GUILD_ID`
+- `DISCORD_UAI_ENABLED`
 
 The OpenAI project key needs Responses write access and Embeddings access
 because report retrieval embeds incoming queries. The FantasyPros key is not
@@ -86,8 +88,10 @@ real user authentication before exposing the query endpoint to untrusted users.
 
 Discord calls `POST /v1/discord/interactions` directly. That route does not use
 `MAGIFF_API_KEY`; it verifies Discord's Ed25519 request signature, restricts
-commands to `DISCORD_GUILD_ID`, immediately shows the quoted question and a
-thinking indicator, and edits that message after MAGIFF finishes. `/ask` runs
+commands to the enabled test/UAI guild allowlist, immediately shows the quoted
+question and a thinking indicator, and edits that message after MAGIFF finishes.
+The test guild can use every command; UAI gets only `/news` and `/stats` and can
+be disabled independently. `/ask` runs
 the agent; `/news` performs a deterministic newest-first report read, while
 `/stats` performs deterministic structured lookup and safe formula analytics
 with native field autocomplete. Neither direct command invokes an LLM. See the
@@ -99,7 +103,9 @@ Add these runtime variables to Render alongside the existing API variables:
 ```text
 DISCORD_APPLICATION_ID=the-application-id-from-General-Information
 DISCORD_PUBLIC_KEY=the-public-key-from-General-Information
-DISCORD_GUILD_ID=the-private-server-id
+DISCORD_TEST_GUILD_ID=the-private-test-server-id
+DISCORD_UAI_GUILD_ID=the-friends-server-id
+DISCORD_UAI_ENABLED=true
 ```
 
 Keep the bot token only in the project-root local `.env`; it is needed for
@@ -123,8 +129,11 @@ After Render deploys the Discord code:
 4. Install the application in the configured server if it is not already
    installed, then run `/ask`, `/news`, or `/stats` there.
 
-The command is registered at guild scope, so changes appear quickly and it is
-not published globally. Render's free service can sleep; a cold start may miss
+Commands are registered at guild scope, so changes appear quickly and they are
+not published globally. The registration job installs `/ask`, `/news`, and
+`/stats` in the test guild, but only `/news` and `/stats` in UAI. Setting
+`DISCORD_UAI_ENABLED=false` blocks execution there without deleting its visible
+commands. Render's free service can sleep; a cold start may miss
 Discord's three-second acknowledgement deadline. Wake `/health` before a demo.
 Do not place `DISCORD_BOT_TOKEN`, `MAGIFF_API_KEY`, or any provider secret in
 Discord URLs, source control, or browser code.

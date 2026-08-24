@@ -191,7 +191,10 @@ STATS_COMMAND = {
     ],
 }
 
-DISCORD_COMMANDS = (ASK_COMMAND, NEWS_COMMAND, STATS_COMMAND)
+TEST_COMMANDS = (ASK_COMMAND, NEWS_COMMAND, STATS_COMMAND)
+UAI_COMMANDS = (NEWS_COMMAND, STATS_COMMAND)
+# Backwards-compatible name for callers that expect the full command catalog.
+DISCORD_COMMANDS = TEST_COMMANDS
 
 
 def register_guild_command(
@@ -232,33 +235,41 @@ def register_guild_command(
 def main() -> None:
     load_dotenv(PROJECT_ROOT / ".env")
     application_id = os.getenv("DISCORD_APPLICATION_ID", "").strip()
-    guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
+    test_guild_id = os.getenv("DISCORD_TEST_GUILD_ID", "").strip()
+    uai_guild_id = os.getenv("DISCORD_UAI_GUILD_ID", "").strip()
     bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
     missing = [
         name
         for name, value in {
             "DISCORD_APPLICATION_ID": application_id,
-            "DISCORD_GUILD_ID": guild_id,
+            "DISCORD_TEST_GUILD_ID": test_guild_id,
             "DISCORD_BOT_TOKEN": bot_token,
         }.items()
         if not value
     ]
     if missing:
         raise RuntimeError("Missing Discord configuration: " + ", ".join(missing))
+    if uai_guild_id and uai_guild_id == test_guild_id:
+        raise RuntimeError("Discord test and UAI guild IDs must be different")
 
-    commands = [
-        register_guild_command(
-            application_id=application_id,
-            guild_id=guild_id,
-            bot_token=bot_token,
-            command=command,
-        )
-        for command in DISCORD_COMMANDS
-    ]
-    print(
-        json.dumps(
+    profiles = [("test", test_guild_id, TEST_COMMANDS)]
+    if uai_guild_id:
+        profiles.append(("uai", uai_guild_id, UAI_COMMANDS))
+
+    registrations = []
+    for profile, guild_id, profile_commands in profiles:
+        commands = [
+            register_guild_command(
+                application_id=application_id,
+                guild_id=guild_id,
+                bot_token=bot_token,
+                command=command,
+            )
+            for command in profile_commands
+        ]
+        registrations.append(
             {
-                "status": "registered",
+                "profile": profile,
                 "guild_id": guild_id,
                 "commands": [
                     {
@@ -268,6 +279,13 @@ def main() -> None:
                     }
                     for command in commands
                 ],
+            }
+        )
+    print(
+        json.dumps(
+            {
+                "status": "registered",
+                "profiles": registrations,
             },
             indent=2,
         )

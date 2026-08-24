@@ -56,9 +56,17 @@ class ApiSettings(BaseSettings):
         default=None,
         validation_alias="DISCORD_PUBLIC_KEY",
     )
-    discord_guild_id: str | None = Field(
+    discord_test_guild_id: str | None = Field(
         default=None,
-        validation_alias="DISCORD_GUILD_ID",
+        validation_alias="DISCORD_TEST_GUILD_ID",
+    )
+    discord_uai_guild_id: str | None = Field(
+        default=None,
+        validation_alias="DISCORD_UAI_GUILD_ID",
+    )
+    discord_uai_enabled: bool = Field(
+        default=False,
+        validation_alias="DISCORD_UAI_ENABLED",
     )
 
     @property
@@ -79,7 +87,7 @@ class ApiSettings(BaseSettings):
             (
                 self.discord_application_id,
                 self.discord_public_key_value,
-                self.discord_guild_id,
+                self.discord_test_guild_id,
             )
         )
 
@@ -88,7 +96,7 @@ class ApiSettings(BaseSettings):
         values = (
             self.discord_application_id,
             self.discord_public_key_value,
-            self.discord_guild_id,
+            self.discord_test_guild_id,
         )
         return any(values) and not all(values)
 
@@ -125,13 +133,34 @@ class ApiSettings(BaseSettings):
         if self.discord_partially_configured:
             raise RuntimeError(
                 "Discord requires DISCORD_APPLICATION_ID, DISCORD_PUBLIC_KEY, "
-                "and DISCORD_GUILD_ID together"
+                "and DISCORD_TEST_GUILD_ID together"
+            )
+        if (
+            (self.discord_uai_guild_id or self.discord_uai_enabled)
+            and not self.discord_configured
+        ):
+            raise RuntimeError(
+                "Discord UAI configuration requires the application, public "
+                "key, and test guild configuration"
             )
         if self.discord_configured:
             if not self.discord_application_id.isdigit():
                 raise RuntimeError("DISCORD_APPLICATION_ID must be numeric")
-            if not self.discord_guild_id.isdigit():
-                raise RuntimeError("DISCORD_GUILD_ID must be numeric")
+            if not self.discord_test_guild_id.isdigit():
+                raise RuntimeError("DISCORD_TEST_GUILD_ID must be numeric")
+            if (
+                self.discord_uai_guild_id is not None
+                and not self.discord_uai_guild_id.isdigit()
+            ):
+                raise RuntimeError("DISCORD_UAI_GUILD_ID must be numeric")
+            if self.discord_uai_enabled and not self.discord_uai_guild_id:
+                raise RuntimeError(
+                    "DISCORD_UAI_ENABLED requires DISCORD_UAI_GUILD_ID"
+                )
+            if self.discord_uai_guild_id == self.discord_test_guild_id:
+                raise RuntimeError(
+                    "Discord test and UAI guild IDs must be different"
+                )
             try:
                 public_key = bytes.fromhex(self.discord_public_key_value or "")
             except ValueError as error:
@@ -153,3 +182,15 @@ class ApiSettings(BaseSettings):
             raise RuntimeError(
                 "Missing production configuration: " + ", ".join(missing)
             )
+
+    def discord_guild_profile(self, guild_id: str) -> Literal["test", "uai"] | None:
+        """Return the enabled feature profile for one Discord guild."""
+        if guild_id == self.discord_test_guild_id:
+            return "test"
+        if (
+            self.discord_uai_enabled
+            and self.discord_uai_guild_id is not None
+            and guild_id == self.discord_uai_guild_id
+        ):
+            return "uai"
+        return None

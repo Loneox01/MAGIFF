@@ -10,6 +10,10 @@ Discord slash-command parameters are separate form fields presented by Discord.
 Users do not need to remember comma-separated text or manually parse a command
 string.
 
+The test guild receives all commands. The UAI friends guild receives the stable
+`/news` and `/stats` subset; its runtime access can be toggled independently
+with `DISCORD_UAI_ENABLED`.
+
 ### `/ask`
 
 Runs the routed MAGIFF agent and can use structured NFL tools and report

@@ -289,13 +289,31 @@ def create_app(
             return JSONResponse(
                 discord_message("That Discord interaction is not supported.")
             )
-        if str(payload.get("guild_id", "")) != api_settings.discord_guild_id:
-            return JSONResponse(
-                discord_message("MAGIFF is private to its configured server.")
-            )
-
         data = payload.get("data")
         command_name = data.get("name") if isinstance(data, dict) else None
+        guild_id = str(payload.get("guild_id", ""))
+        guild_profile = api_settings.discord_guild_profile(guild_id)
+        if guild_profile is None:
+            if interaction_type == APPLICATION_COMMAND_AUTOCOMPLETE_INTERACTION:
+                return JSONResponse(
+                    {
+                        "type": APPLICATION_COMMAND_AUTOCOMPLETE_RESPONSE,
+                        "data": {"choices": []},
+                    }
+                )
+            if (
+                guild_id == api_settings.discord_uai_guild_id
+                and not api_settings.discord_uai_enabled
+            ):
+                return JSONResponse(
+                    discord_message(
+                        "MAGIFF is temporarily disabled in this server."
+                    )
+                )
+            return JSONResponse(
+                discord_message("MAGIFF is private to its configured servers.")
+            )
+
         if interaction_type == APPLICATION_COMMAND_AUTOCOMPLETE_INTERACTION:
             choices = (
                 stats_autocomplete_choices(payload)
@@ -320,6 +338,12 @@ def create_app(
         claimed = interaction_ids.claim(interaction_id)
         suppress_embeds = False
         if command_name == "ask":
+            if guild_profile != "test":
+                return JSONResponse(
+                    discord_message(
+                        "`/ask` is only enabled in MAGIFF's test server."
+                    )
+                )
             prompt = extract_ask_prompt(payload)
             if prompt is None:
                 return JSONResponse(
