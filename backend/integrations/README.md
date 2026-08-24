@@ -121,10 +121,12 @@ Season-total mode selects each team-position's highest full-season PPR scorer.
 PPG mode instead selects its highest PPR average across that player's stored
 stat-row games for the team. The default remains season totals.
 
-The season total maps to a 0–17 through 17–0 record using padded score anchors:
-800, 850, 900, 100-point middle steps through 2,200, then 2,250 and 2,300. The
-PPG mode uses those same anchors divided by 17. The closest anchor determines
-the record, with exact ties favoring the lower one.
+The final score maps to a 0–17 through 17–0 record using a dynamic scale for the
+selected season and scoring mode. The service calculates the lowest and highest
+fully legal rosters, places the 0–17 boundary at 10% of that attainable range and
+the 17–0 boundary at 85%, and evenly spaces records 1–16 between them. Season-total
+boundaries are rounded to the nearest 25 points and PPG boundaries to the nearest
+whole point.
 Sessions, picks, users, and actions persist in Supabase; versioned buttons and
 database constraints reject stale clicks, duplicate deliveries, and repeated
 teams or players.

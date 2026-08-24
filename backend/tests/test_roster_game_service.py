@@ -9,9 +9,12 @@ from services.roster_game import (
     GameScoringMode,
     GameStatus,
     PlayerPoolEntry,
+    RecordScale,
     RosterSlot,
     RosterGameService,
     RosterGameState,
+    build_record_scale,
+    legal_score_extrema,
     wins_for_score,
 )
 
@@ -26,7 +29,7 @@ class FakeRosterGameRepository:
                 display_name=f"{team} {position}",
                 team=team,
                 position=position,
-                fantasy_points_ppr=100 + team_number * 2 + position_number,
+                fantasy_points_ppr=100 + team_number * 20 + position_number,
                 team_name=f"Team {team}",
                 team_logo_url=f"https://example.com/{team}.png",
                 team_color="112233",
@@ -242,17 +245,68 @@ class RosterGameServiceTests(unittest.TestCase):
         self.assertEqual(result.outcome, GameOutcome.READY)
         self.assertEqual(result.state.scoring_mode, GameScoringMode.PPG)
 
-    def test_record_scale_has_padded_extremes(self) -> None:
-        self.assertEqual(wins_for_score(800), 0)
-        self.assertEqual(wins_for_score(850), 1)
-        self.assertEqual(wins_for_score(900), 2)
-        self.assertEqual(wins_for_score(1_500), 8)
-        self.assertEqual(wins_for_score(2_200), 15)
-        self.assertEqual(wins_for_score(2_250), 16)
-        self.assertEqual(wins_for_score(2_300), 17)
-        self.assertEqual(wins_for_score(800 / 17, GameScoringMode.PPG), 0)
-        self.assertEqual(wins_for_score(1_500 / 17, GameScoringMode.PPG), 8)
-        self.assertEqual(wins_for_score(2_300 / 17, GameScoringMode.PPG), 17)
+    def test_legal_extrema_obey_roster_and_unique_team_constraints(self) -> None:
+        minimum, maximum = legal_score_extrema(self.repository.pool)
+
+        self.assertEqual(minimum, 1_130)
+        self.assertEqual(maximum, 4_632)
+
+    def test_legal_extrema_reject_a_player_repeated_across_teams(self) -> None:
+        duplicate_pool = [
+            replace(entry, player_id="traded-player")
+            if entry.team in {"T30", "T31"}
+            else entry
+            for entry in self.repository.pool
+        ]
+
+        _, maximum = legal_score_extrema(duplicate_pool)
+
+        self.assertEqual(maximum, 4_512)
+
+    def test_season_record_scale_uses_10_and_85_percent_boundaries(self) -> None:
+        scale = build_record_scale(
+            self.repository.pool,
+            GameScoringMode.SEASON_TOTAL,
+        )
+
+        self.assertEqual(scale.legal_minimum, 1_130)
+        self.assertEqual(scale.legal_maximum, 4_632)
+        self.assertEqual(scale.zero_win_cutoff, 1_475)
+        self.assertEqual(scale.undefeated_cutoff, 4_100)
+        self.assertEqual(len(scale.win_boundaries), 17)
+        self.assertTrue(
+            all(boundary % 25 == 0 for boundary in scale.win_boundaries)
+        )
+        self.assertEqual(wins_for_score(1_474.9, scale), 0)
+        self.assertEqual(wins_for_score(1_475, scale), 1)
+        self.assertEqual(wins_for_score(4_099.9, scale), 16)
+        self.assertEqual(wins_for_score(4_100, scale), 17)
+
+    def test_ppg_record_scale_rounds_boundaries_to_whole_points(self) -> None:
+        ppg_pool = [
+            replace(entry, fantasy_points_ppr=entry.fantasy_points_ppr / 10)
+            for entry in self.repository.pool
+        ]
+        scale = build_record_scale(ppg_pool, GameScoringMode.PPG)
+
+        self.assertEqual(scale.zero_win_cutoff, 148)
+        self.assertEqual(scale.undefeated_cutoff, 411)
+        self.assertTrue(
+            all(boundary.is_integer() for boundary in scale.win_boundaries)
+        )
+
+    def test_score_mapping_uses_hard_boundaries(self) -> None:
+        scale = RecordScale(
+            legal_minimum=650,
+            legal_maximum=2_590,
+            win_boundaries=tuple(850 + index * 25 for index in range(17)),
+        )
+
+        self.assertEqual(wins_for_score(849.9, scale), 0)
+        self.assertEqual(wins_for_score(850, scale), 1)
+        self.assertEqual(wins_for_score(1_025, scale), 8)
+        self.assertEqual(wins_for_score(1_249.9, scale), 16)
+        self.assertEqual(wins_for_score(1_250, scale), 17)
 
 
 if __name__ == "__main__":

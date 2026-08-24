@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import random
 import uuid
+from collections import Counter
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from math import floor
 from typing import Protocol, Sequence
 
 
@@ -35,31 +37,11 @@ BASE_SLOTS_BY_POSITION = {
     "TE": (RosterSlot.TE,),
 }
 
-# Each index is a win total. The closer anchor wins; ties favor the lower
-# record. Two 50-point steps pad each tail and the middle uses 100-point steps.
-RECORD_SCORE_ANCHORS = (
-    800.0,
-    850.0,
-    900.0,
-    1_000.0,
-    1_100.0,
-    1_200.0,
-    1_300.0,
-    1_400.0,
-    1_500.0,
-    1_600.0,
-    1_700.0,
-    1_800.0,
-    1_900.0,
-    2_000.0,
-    2_100.0,
-    2_200.0,
-    2_250.0,
-    2_300.0,
-)
-PPG_RECORD_SCORE_ANCHORS = tuple(
-    anchor / 17 for anchor in RECORD_SCORE_ANCHORS
-)
+ZERO_WIN_RANGE_FRACTION = 0.10
+UNDEFEATED_RANGE_FRACTION = 0.85
+MIDDLE_RECORD_COUNT = 16
+SEASON_TOTAL_SCORE_INCREMENT = 25.0
+PPG_SCORE_INCREMENT = 1.0
 
 
 class GameScoringMode(StrEnum):
@@ -104,6 +86,25 @@ class PlayerPoolEntry:
     team_name: str
     team_logo_url: str | None = None
     team_color: str | None = None
+
+
+@dataclass(frozen=True)
+class RecordScale:
+    """Season-specific hard score boundaries for records from 0-17 to 17-0."""
+
+    legal_minimum: float
+    legal_maximum: float
+    # Each value is the minimum score for the next win total. There are 17
+    # boundaries: 0 -> 1 through 16 -> 17.
+    win_boundaries: tuple[float, ...]
+
+    @property
+    def zero_win_cutoff(self) -> float:
+        return self.win_boundaries[0]
+
+    @property
+    def undefeated_cutoff(self) -> float:
+        return self.win_boundaries[-1]
 
 
 @dataclass(frozen=True)
@@ -174,22 +175,6 @@ class RosterGameRepository(Protocol):
     ) -> bool: ...
 
 
-def wins_for_score(
-    total_points: float,
-    scoring_mode: GameScoringMode = GameScoringMode.SEASON_TOTAL,
-) -> int:
-    """Map a roster total to the nearest padded 0-17 through 17-0 anchor."""
-    anchors = (
-        PPG_RECORD_SCORE_ANCHORS
-        if scoring_mode == GameScoringMode.PPG
-        else RECORD_SCORE_ANCHORS
-    )
-    return min(
-        range(len(anchors)),
-        key=lambda wins: (abs(total_points - anchors[wins]), wins),
-    )
-
-
 def position_choices(slot: RosterSlot) -> tuple[str, ...]:
     if slot == RosterSlot.QB:
         return ("QB",)
@@ -200,6 +185,133 @@ def position_choices(slot: RosterSlot) -> tuple[str, ...]:
     if slot == RosterSlot.TE:
         return ("TE",)
     return FLEX_POSITIONS
+
+
+def _round_to_increment(value: float, increment: float) -> float:
+    """Round a positive fantasy score to the nearest configured increment."""
+    return round(floor(value / increment + 0.5) * increment, 2)
+
+
+def legal_score_extrema(
+    pool: Sequence[PlayerPoolEntry],
+) -> tuple[float, float]:
+    """Return the minimum and maximum scores of any fully legal roster.
+
+    The dynamic program enforces every game constraint that can affect the
+    final roster: all seven slots, no repeated team, and no repeated player.
+    Only player IDs that occur more than once in the team-position pool need
+    to be represented in the state mask.
+    """
+    duplicate_player_ids = {
+        player_id
+        for player_id, count in Counter(
+            entry.player_id for entry in pool
+        ).items()
+        if count > 1
+    }
+    duplicate_bits = {
+        player_id: 1 << index
+        for index, player_id in enumerate(sorted(duplicate_player_ids))
+    }
+    entries_by_team: dict[str, list[PlayerPoolEntry]] = {}
+    for entry in pool:
+        entries_by_team.setdefault(entry.team, []).append(entry)
+
+    # (filled slot mask, used duplicate-player mask) -> (minimum, maximum)
+    states: dict[tuple[int, int], tuple[float, float]] = {(0, 0): (0.0, 0.0)}
+    for team in sorted(entries_by_team):
+        next_states = dict(states)
+        for (slot_mask, player_mask), (minimum, maximum) in states.items():
+            for entry in entries_by_team[team]:
+                player_bit = duplicate_bits.get(entry.player_id, 0)
+                if player_bit and player_mask & player_bit:
+                    continue
+                for slot_index, slot in enumerate(ROSTER_SLOTS):
+                    slot_bit = 1 << slot_index
+                    if slot_mask & slot_bit:
+                        continue
+                    if entry.position not in position_choices(slot):
+                        continue
+                    key = (slot_mask | slot_bit, player_mask | player_bit)
+                    candidate = (
+                        minimum + entry.fantasy_points_ppr,
+                        maximum + entry.fantasy_points_ppr,
+                    )
+                    existing = next_states.get(key)
+                    if existing is None:
+                        next_states[key] = candidate
+                    else:
+                        next_states[key] = (
+                            min(existing[0], candidate[0]),
+                            max(existing[1], candidate[1]),
+                        )
+        states = next_states
+
+    complete_slot_mask = (1 << len(ROSTER_SLOTS)) - 1
+    complete_scores = [
+        extrema
+        for (slot_mask, _), extrema in states.items()
+        if slot_mask == complete_slot_mask
+    ]
+    if not complete_scores:
+        raise ValueError("The player pool cannot construct a legal full roster")
+    return (
+        round(min(score[0] for score in complete_scores), 2),
+        round(max(score[1] for score in complete_scores), 2),
+    )
+
+
+def build_record_scale(
+    pool: Sequence[PlayerPoolEntry],
+    scoring_mode: GameScoringMode,
+) -> RecordScale:
+    """Build rounded record boundaries from a season's attainable score span."""
+    legal_minimum, legal_maximum = legal_score_extrema(pool)
+    score_range = legal_maximum - legal_minimum
+    if score_range <= 0:
+        raise ValueError("The legal roster score range must be positive")
+
+    increment = (
+        PPG_SCORE_INCREMENT
+        if scoring_mode == GameScoringMode.PPG
+        else SEASON_TOTAL_SCORE_INCREMENT
+    )
+    low = _round_to_increment(
+        legal_minimum + ZERO_WIN_RANGE_FRACTION * score_range,
+        increment,
+    )
+    high = _round_to_increment(
+        legal_minimum + UNDEFEATED_RANGE_FRACTION * score_range,
+        increment,
+    )
+    if high <= low:
+        raise ValueError("The rounded record score range is too narrow")
+
+    win_boundaries = tuple(
+        _round_to_increment(
+            low + index * (high - low) / MIDDLE_RECORD_COUNT,
+            increment,
+        )
+        for index in range(MIDDLE_RECORD_COUNT + 1)
+    )
+    if any(
+        current <= previous
+        for previous, current in zip(win_boundaries, win_boundaries[1:])
+    ):
+        raise ValueError("Rounded record boundaries must be strictly increasing")
+    return RecordScale(
+        legal_minimum=legal_minimum,
+        legal_maximum=legal_maximum,
+        win_boundaries=win_boundaries,
+    )
+
+
+def wins_for_score(total_points: float, scale: RecordScale) -> int:
+    """Map a score to a record using explicit season-specific boundaries."""
+    for wins, boundary in enumerate(scale.win_boundaries):
+        if total_points < boundary:
+            return wins
+    return 17
 
 
 class RosterGameService:
@@ -222,6 +334,10 @@ class RosterGameService:
         self._pool_cache: dict[
             tuple[int, GameScoringMode],
             tuple[PlayerPoolEntry, ...],
+        ] = {}
+        self._record_scale_cache: dict[
+            tuple[int, GameScoringMode],
+            RecordScale,
         ] = {}
 
     def start(
@@ -265,6 +381,13 @@ class RosterGameService:
                     f"The {selected_season} regular-season pool does not contain "
                     "all 32 teams and four fantasy positions."
                 ),
+            )
+        try:
+            self._record_scale(selected_season, scoring_mode, pool)
+        except ValueError as error:
+            return GameResult(
+                GameOutcome.SEASON_UNAVAILABLE,
+                note=f"The {selected_season} game pool cannot be scored: {error}.",
             )
         pending = self._new_roll(pool, (), ())
         if pending is None:
@@ -377,6 +500,21 @@ class RosterGameService:
                 self.repository.player_pool(season, scoring_mode)
             )
         return self._pool_cache[key]
+
+    def _record_scale(
+        self,
+        season: int,
+        scoring_mode: GameScoringMode,
+        pool: Sequence[PlayerPoolEntry] | None = None,
+    ) -> RecordScale:
+        key = (season, scoring_mode)
+        if key not in self._record_scale_cache:
+            selected_pool = pool or self._pool(season, scoring_mode)
+            self._record_scale_cache[key] = build_record_scale(
+                selected_pool,
+                scoring_mode,
+            )
+        return self._record_scale_cache[key]
 
     def _new_roll(
         self,
@@ -564,7 +702,10 @@ class RosterGameService:
         picks = (*state.picks, pick)
         if len(picks) == len(ROSTER_SLOTS):
             total = round(sum(value.player.fantasy_points_ppr for value in picks), 2)
-            wins = wins_for_score(total, state.scoring_mode)
+            wins = wins_for_score(
+                total,
+                self._record_scale(state.season, state.scoring_mode, pool),
+            )
             completed = replace(
                 state,
                 status=GameStatus.COMPLETED,
