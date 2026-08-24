@@ -74,13 +74,14 @@ def _integer(values: dict[str, object], name: str) -> int | None:
     return value
 
 
-def _number(values: dict[str, object], name: str) -> float | None:
+def _number(values: dict[str, object], name: str) -> int | float | None:
     value = values.get(name)
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a number")
-    return float(value)
+    numeric = float(value)
+    return int(numeric) if numeric.is_integer() else numeric
 
 
 def extract_stats_query(payload: dict[str, Any]) -> StatsQuery:

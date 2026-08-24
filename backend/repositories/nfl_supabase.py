@@ -366,6 +366,11 @@ def get_player_season_candidates(
     minimum_value: float | None,
 ) -> list[dict]:
     """Fetch bounded pages of season rows for application-side analytics."""
+    normalized_minimum = (
+        int(minimum_value)
+        if isinstance(minimum_value, float) and minimum_value.is_integer()
+        else minimum_value
+    )
     selected = list(
         dict.fromkeys(
             [
@@ -395,8 +400,8 @@ def get_player_season_candidates(
         )
         if position is not None:
             query = query.eq("position", position)
-        if minimum_field is not None and minimum_value is not None:
-            query = query.gte(minimum_field, minimum_value)
+        if minimum_field is not None and normalized_minimum is not None:
+            query = query.gte(minimum_field, normalized_minimum)
 
         page = (
             query.order("player_id")

@@ -487,6 +487,20 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(query.team, "Eagles")
         self.assertEqual(query.perspective, "defense")
 
+    def test_stats_parser_normalizes_discord_whole_number_threshold(self) -> None:
+        payload = self.stats_payload()
+        payload["data"]["options"][0]["options"].extend(
+            [
+                {"name": "minimum_field", "type": 3, "value": "carries"},
+                {"name": "minimum_value", "type": 10, "value": 100.0},
+            ]
+        )
+
+        query = extract_stats_query(payload)
+
+        self.assertEqual(query.minimum_value, 100)
+        self.assertIsInstance(query.minimum_value, int)
+
     def test_stats_autocomplete_uses_defensive_catalog(self) -> None:
         payload = self.stats_payload()
         payload["type"] = 4
