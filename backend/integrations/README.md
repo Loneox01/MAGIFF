@@ -12,7 +12,8 @@ string.
 
 The test guild receives all commands. The UAI friends guild receives the stable
 `/news` and `/stats` subset; its runtime access can be toggled independently
-with `DISCORD_UAI_ENABLED`.
+with `DISCORD_UAI_ENABLED`. Roster roulette remains test-only while its rules
+and scoring are calibrated.
 
 ### `/ask`
 
@@ -88,6 +89,38 @@ Autocomplete helps assemble an expression, but the backend always validates the
 submitted formula because Discord permits arbitrary text. Omitting `season`
 selects the latest stored season available for that query. Player and team
 names use the same conservative resolution and ambiguity punts as `/news`.
+
+### `/game roster`
+
+Starts a seven-pick roster-roulette game without invoking an LLM. Each roll
+selects an unused NFL team and one open roster slot. The season's highest PPR
+scorer for that team and position is attached to the roll. FLEX resolves to an
+RB, WR, or TE.
+
+```text
+/game roster
+/game roster season:2024
+/game roster season:2025 reveal:true
+```
+
+| Option | Required | Accepted value | Default |
+|---|---:|---|---|
+| `season` | No | A stored completed NFL season | Latest stored season |
+| `reveal` | No | `true` or `false` | `false` |
+
+The lineup is QB, two RBs, two WRs, one TE, and one FLEX. Accepted teams and
+players cannot repeat. Every game has one team reroll and one position reroll;
+the corresponding button is disabled after use. Hidden mode shows only the
+rolled team and position until the final reveal, while `reveal:true` also shows
+the player and season PPR total during each roll. The current team logo appears
+in the roll card.
+
+The final total maps to a 0–17 through 17–0 record using padded score anchors:
+800, 850, 900, 100-point middle steps through 2,200, then 2,250 and 2,300. The
+closest anchor determines the record, with exact ties favoring the lower one.
+Sessions, picks, users, and actions persist in Supabase; versioned buttons and
+database constraints reject stale clicks, duplicate deliveries, and repeated
+teams or players.
 
 ## Adding another Discord command
 

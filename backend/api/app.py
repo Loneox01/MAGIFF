@@ -29,7 +29,9 @@ from integrations.discord import (
     EPHEMERAL_MESSAGE_FLAG,
     PING_INTERACTION,
     PONG_RESPONSE,
+    MESSAGE_COMPONENT_INTERACTION,
     SUPPRESS_EMBEDS_MESSAGE_FLAG,
+    UPDATE_MESSAGE_RESPONSE,
     DiscordCompletion,
     DiscordInteractionRunner,
     DiscordRequestVerifier,
@@ -37,6 +39,13 @@ from integrations.discord import (
     RecentInteractionIds,
     extract_ask_prompt,
     format_discord_thinking,
+)
+from integrations.discord_game import (
+    discord_user,
+    extract_game_component,
+    extract_game_start,
+    format_game_error,
+    format_game_state,
 )
 from integrations.discord_news import (
     DiscordNewsRunner,
@@ -53,6 +62,10 @@ from integrations.discord_stats import (
 )
 from services.agent import AgentService
 from services.news import NewsService
+from services.roster_game import (
+    GameOutcome,
+    RosterGameService,
+)
 from services.stats import StatsService
 
 from .config import ApiSettings
@@ -74,6 +87,7 @@ def create_app(
     agent_service: AgentService | None = None,
     news_service: NewsService | None = None,
     stats_service: StatsService | None = None,
+    roster_game_service: RosterGameService | None = None,
     discord_webhook_client: DiscordWebhookClient | None = None,
     discord_interaction_ids: RecentInteractionIds | None = None,
 ) -> FastAPI:
@@ -84,6 +98,7 @@ def create_app(
     discord_runner = None
     discord_news_runner = None
     discord_stats_runner = None
+    discord_game_service = None
     interaction_ids = discord_interaction_ids or RecentInteractionIds()
     if api_settings.discord_configured:
         discord_verifier = DiscordRequestVerifier(
@@ -104,6 +119,7 @@ def create_app(
             stats_service=stats_service or StatsService(),
             webhook_client=discord_webhook_client,
         )
+        discord_game_service = roster_game_service or RosterGameService()
 
     app = FastAPI(
         title="MAGIFF Agent API",
@@ -285,6 +301,7 @@ def create_app(
         if interaction_type not in {
             APPLICATION_COMMAND_INTERACTION,
             APPLICATION_COMMAND_AUTOCOMPLETE_INTERACTION,
+            MESSAGE_COMPONENT_INTERACTION,
         }:
             return JSONResponse(
                 discord_message("That Discord interaction is not supported.")
@@ -337,6 +354,54 @@ def create_app(
 
         claimed = interaction_ids.claim(interaction_id)
         suppress_embeds = False
+        if interaction_type == MESSAGE_COMPONENT_INTERACTION:
+            if guild_profile != "test" or discord_game_service is None:
+                return JSONResponse(
+                    discord_message(
+                        "Roster roulette is only enabled in MAGIFF's test server."
+                    )
+                )
+            try:
+                component = extract_game_component(payload)
+                user_id, _ = discord_user(payload)
+                game_result = discord_game_service.act(
+                    game_id=component.game_id,
+                    expected_version=component.expected_version,
+                    discord_user_id=user_id,
+                    interaction_id=interaction_id,
+                    action=component.action,
+                )
+            except ValueError as error:
+                return JSONResponse(discord_message(str(error)))
+            except Exception:
+                LOGGER.exception(
+                    "Discord roster game action failed request_id=%s interaction_id=%s",
+                    request.state.request_id,
+                    interaction_id,
+                )
+                return JSONResponse(
+                    discord_message(
+                        "Roster roulette couldn't update. Retry the button in a "
+                        f"moment. Request ID: `{request.state.request_id}`"
+                    )
+                )
+            if game_result.outcome in {
+                GameOutcome.UPDATED,
+                GameOutcome.COMPLETED,
+                GameOutcome.STALE,
+            } and game_result.state is not None:
+                return JSONResponse(
+                    {
+                        "type": UPDATE_MESSAGE_RESPONSE,
+                        "data": format_game_state(
+                            game_result.state,
+                            discord_game_service,
+                            note=game_result.note,
+                        ),
+                    }
+                )
+            return JSONResponse(discord_message(format_game_error(game_result)))
+
         if command_name == "ask":
             if guild_profile != "test":
                 return JSONResponse(
@@ -393,10 +458,58 @@ def create_app(
                     ),
                 )
             content = format_stats_pending(stats_query)
+        elif command_name == "game" and discord_game_service is not None:
+            if guild_profile != "test":
+                return JSONResponse(
+                    discord_message(
+                        "`/game` is only enabled in MAGIFF's test server."
+                    )
+                )
+            if not claimed:
+                return JSONResponse(
+                    discord_message(
+                        "That game-start interaction was already processed."
+                    )
+                )
+            try:
+                game_query = extract_game_start(payload)
+                user_id, display_name = discord_user(payload)
+                game_result = discord_game_service.start(
+                    discord_user_id=user_id,
+                    display_name=display_name,
+                    discord_guild_id=guild_id,
+                    season=game_query.season,
+                    reveal_during_roll=game_query.reveal_during_roll,
+                )
+            except ValueError as error:
+                return JSONResponse(discord_message(str(error)))
+            except Exception:
+                LOGGER.exception(
+                    "Discord roster game start failed request_id=%s interaction_id=%s",
+                    request.state.request_id,
+                    interaction_id,
+                )
+                return JSONResponse(
+                    discord_message(
+                        "Roster roulette couldn't start. Retry in a moment. "
+                        f"Request ID: `{request.state.request_id}`"
+                    )
+                )
+            if game_result.state is None:
+                return JSONResponse(discord_message(format_game_error(game_result)))
+            return JSONResponse(
+                {
+                    "type": CHANNEL_MESSAGE_RESPONSE,
+                    "data": format_game_state(
+                        game_result.state,
+                        discord_game_service,
+                    ),
+                }
+            )
         else:
             return JSONResponse(
                 discord_message(
-                    "Supported commands are `/ask`, `/news`, and `/stats`."
+                    "Supported commands are `/ask`, `/news`, `/stats`, and `/game`."
                 )
             )
 

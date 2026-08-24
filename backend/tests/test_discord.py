@@ -1,4 +1,5 @@
 import json
+import random
 import unittest
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from integrations.discord_stats import (
     stats_autocomplete_choices,
 )
 from jobs.register_discord_commands import (
+    GAME_COMMAND,
     NEWS_COMMAND,
     STATS_COMMAND,
     TEST_COMMANDS,
@@ -36,6 +38,8 @@ from services.news import (
     PlayerCandidate,
 )
 from services.stats import StatsOutcome, StatsResult
+from services.roster_game import RosterGameService
+from tests.test_roster_game_service import FakeRosterGameRepository
 
 
 APPLICATION_ID = "123456789012345678"
@@ -162,6 +166,11 @@ class DiscordTests(unittest.TestCase):
         self.agent = FakeAgentService()
         self.news = FakeNewsService()
         self.stats = FakeStatsService()
+        self.game_repository = FakeRosterGameRepository()
+        self.game = RosterGameService(
+            self.game_repository,
+            rng=random.Random(11),
+        )
         self.webhook = FakeDiscordWebhookClient()
         self.client = TestClient(
             create_app(
@@ -169,6 +178,7 @@ class DiscordTests(unittest.TestCase):
                 agent_service=self.agent,
                 news_service=self.news,
                 stats_service=self.stats,
+                roster_game_service=self.game,
                 discord_webhook_client=self.webhook,
                 discord_interaction_ids=RecentInteractionIds(),
             )
@@ -252,6 +262,32 @@ class DiscordTests(unittest.TestCase):
             },
         }
 
+    def game_payload(self, *, interaction_id: str = "game-interaction") -> dict:
+        return {
+            "id": interaction_id,
+            "application_id": APPLICATION_ID,
+            "guild_id": GUILD_ID,
+            "token": "game-interaction-token",
+            "type": 2,
+            "member": {
+                "nick": "Roster Tester",
+                "user": {
+                    "id": "222222222222222222",
+                    "username": "tester",
+                },
+            },
+            "data": {
+                "name": "game",
+                "options": [
+                    {
+                        "name": "roster",
+                        "type": 1,
+                        "options": [],
+                    }
+                ],
+            },
+        }
+
     def test_rejects_missing_or_invalid_signature(self) -> None:
         unsigned = self.client.post(
             "/v1/discord/interactions",
@@ -328,6 +364,71 @@ class DiscordTests(unittest.TestCase):
 
         self.assertIn("only enabled", response.json()["data"]["content"])
         self.assertEqual(self.agent.prompts, [])
+
+    def test_game_starts_hidden_with_team_art_and_buttons(self) -> None:
+        response = self.signed_post(self.game_payload())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["type"], 4)
+        data = response.json()["data"]
+        self.assertIn("Player and points are hidden", data["content"])
+        self.assertNotIn("season PPR points", data["content"])
+        self.assertTrue(data["embeds"][0]["thumbnail"]["url"])
+        buttons = data["components"][0]["components"]
+        self.assertEqual(
+            [button["label"] for button in buttons],
+            ["Reroll Team", "Reroll Position", "Lock & Spin Next"],
+        )
+
+    def test_game_reveal_mode_and_component_advance(self) -> None:
+        payload = self.game_payload(interaction_id="revealed-game")
+        payload["data"]["options"][0]["options"] = [
+            {"name": "season", "type": 4, "value": 2025},
+            {"name": "reveal", "type": 5, "value": True},
+        ]
+        started = self.signed_post(payload).json()
+        lock_button = started["data"]["components"][0]["components"][2]
+        component_payload = {
+            "id": "lock-component",
+            "application_id": APPLICATION_ID,
+            "guild_id": GUILD_ID,
+            "token": "component-token",
+            "type": 3,
+            "member": payload["member"],
+            "data": {
+                "component_type": 2,
+                "custom_id": lock_button["custom_id"],
+            },
+        }
+
+        advanced = self.signed_post(component_payload)
+
+        self.assertIn("season PPR points", started["data"]["content"])
+        self.assertEqual(advanced.json()["type"], 7)
+        self.assertIn("locked", advanced.json()["data"]["content"].lower())
+
+    def test_game_buttons_reject_a_different_user_ephemerally(self) -> None:
+        started = self.signed_post(self.game_payload()).json()
+        custom_id = started["data"]["components"][0]["components"][2]["custom_id"]
+        payload = self.game_payload(interaction_id="other-user-click")
+        payload["type"] = 3
+        payload["member"]["user"]["id"] = "333333333333333333"
+        payload["data"] = {"component_type": 2, "custom_id": custom_id}
+
+        response = self.signed_post(payload)
+
+        self.assertEqual(response.json()["type"], 4)
+        self.assertEqual(response.json()["data"]["flags"], 64)
+        self.assertIn("Only the player", response.json()["data"]["content"])
+
+    def test_uai_profile_rejects_game(self) -> None:
+        payload = self.game_payload(interaction_id="uai-game")
+        payload["guild_id"] = UAI_GUILD_ID
+
+        response = self.signed_post(payload)
+
+        self.assertIn("only enabled", response.json()["data"]["content"])
+        self.assertEqual(self.game_repository.games, {})
 
     def test_disabled_uai_profile_rejects_commands(self) -> None:
         self.client.app.state.settings.discord_uai_enabled = False
@@ -607,10 +708,20 @@ class DiscordCommandRegistrationTests(unittest.TestCase):
         self.assertTrue(leader_options["minimum_field"]["autocomplete"])
         self.assertNotIn("choices", leader_options["formula"])
 
+    def test_game_command_is_one_roster_subcommand_with_optional_reveal(self) -> None:
+        self.assertEqual(GAME_COMMAND["options"][0]["name"], "roster")
+        options = {
+            option["name"]: option
+            for option in GAME_COMMAND["options"][0]["options"]
+        }
+        self.assertEqual(set(options), {"season", "reveal"})
+        self.assertFalse(options["season"]["required"])
+        self.assertFalse(options["reveal"]["required"])
+
     def test_test_and_uai_command_buckets_are_intentionally_different(self) -> None:
         self.assertEqual(
             {command["name"] for command in TEST_COMMANDS},
-            {"ask", "news", "stats"},
+            {"ask", "news", "stats", "game"},
         )
         self.assertEqual(
             {command["name"] for command in UAI_COMMANDS},

@@ -191,7 +191,36 @@ STATS_COMMAND = {
     ],
 }
 
-TEST_COMMANDS = (ASK_COMMAND, NEWS_COMMAND, STATS_COMMAND)
+GAME_COMMAND = {
+    "name": "game",
+    "type": 1,
+    "description": "Play MAGIFF fantasy-football games",
+    "options": [
+        {
+            "name": "roster",
+            "description": "Build a seven-player roster from team and position rolls",
+            "type": 1,
+            "options": [
+                {
+                    "name": "season",
+                    "description": "Completed NFL season; defaults to latest stored season",
+                    "type": 4,
+                    "required": False,
+                    "min_value": 1999,
+                    "max_value": 2100,
+                },
+                {
+                    "name": "reveal",
+                    "description": "Show each player and PPR total during rolls (default false)",
+                    "type": 5,
+                    "required": False,
+                },
+            ],
+        }
+    ],
+}
+
+TEST_COMMANDS = (ASK_COMMAND, NEWS_COMMAND, STATS_COMMAND, GAME_COMMAND)
 UAI_COMMANDS = (NEWS_COMMAND, STATS_COMMAND)
 # Backwards-compatible name for callers that expect the full command catalog.
 DISCORD_COMMANDS = TEST_COMMANDS
