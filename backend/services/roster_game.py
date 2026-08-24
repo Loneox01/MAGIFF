@@ -57,6 +57,14 @@ RECORD_SCORE_ANCHORS = (
     2_250.0,
     2_300.0,
 )
+PPG_RECORD_SCORE_ANCHORS = tuple(
+    anchor / 17 for anchor in RECORD_SCORE_ANCHORS
+)
+
+
+class GameScoringMode(StrEnum):
+    SEASON_TOTAL = "season_total"
+    PPG = "ppg"
 
 
 class GameStatus(StrEnum):
@@ -118,6 +126,7 @@ class RosterGameState:
     discord_user_id: str
     discord_guild_id: str
     season: int
+    scoring_mode: GameScoringMode
     reveal_during_roll: bool
     status: GameStatus
     pending: RolledPlayer | None
@@ -142,7 +151,11 @@ class RosterGameRepository(Protocol):
 
     def season_is_complete(self, season: int) -> bool: ...
 
-    def player_pool(self, season: int) -> list[PlayerPoolEntry]: ...
+    def player_pool(
+        self,
+        season: int,
+        scoring_mode: GameScoringMode,
+    ) -> list[PlayerPoolEntry]: ...
 
     def ensure_user(self, discord_user_id: str, display_name: str | None) -> str: ...
 
@@ -161,11 +174,19 @@ class RosterGameRepository(Protocol):
     ) -> bool: ...
 
 
-def wins_for_score(total_points: float) -> int:
+def wins_for_score(
+    total_points: float,
+    scoring_mode: GameScoringMode = GameScoringMode.SEASON_TOTAL,
+) -> int:
     """Map a roster total to the nearest padded 0-17 through 17-0 anchor."""
+    anchors = (
+        PPG_RECORD_SCORE_ANCHORS
+        if scoring_mode == GameScoringMode.PPG
+        else RECORD_SCORE_ANCHORS
+    )
     return min(
-        range(len(RECORD_SCORE_ANCHORS)),
-        key=lambda wins: (abs(total_points - RECORD_SCORE_ANCHORS[wins]), wins),
+        range(len(anchors)),
+        key=lambda wins: (abs(total_points - anchors[wins]), wins),
     )
 
 
@@ -198,7 +219,10 @@ class RosterGameService:
             repository = SupabaseRosterGameRepository()
         self.repository = repository
         self.rng = rng or random.SystemRandom()
-        self._pool_cache: dict[int, tuple[PlayerPoolEntry, ...]] = {}
+        self._pool_cache: dict[
+            tuple[int, GameScoringMode],
+            tuple[PlayerPoolEntry, ...],
+        ] = {}
 
     def start(
         self,
@@ -207,6 +231,7 @@ class RosterGameService:
         display_name: str | None,
         discord_guild_id: str,
         season: int | None = None,
+        scoring_mode: GameScoringMode = GameScoringMode.SEASON_TOTAL,
         reveal_during_roll: bool = False,
     ) -> GameResult:
         selected_season = season or self.repository.latest_completed_season()
@@ -223,7 +248,7 @@ class RosterGameService:
                     "the stored weekly data."
                 ),
             )
-        pool = self._pool(selected_season)
+        pool = self._pool(selected_season, scoring_mode)
         team_positions: dict[str, set[str]] = {}
         for entry in pool:
             team_positions.setdefault(entry.team, set()).add(entry.position)
@@ -254,6 +279,7 @@ class RosterGameService:
             discord_user_id=discord_user_id,
             discord_guild_id=discord_guild_id,
             season=selected_season,
+            scoring_mode=scoring_mode,
             reveal_during_roll=reveal_during_roll,
             status=GameStatus.ACTIVE,
             pending=pending,
@@ -284,7 +310,7 @@ class RosterGameService:
         if state.status != GameStatus.ACTIVE or state.pending is None:
             return GameResult(GameOutcome.ALREADY_COMPLETE, state)
 
-        pool = self._pool(state.season)
+        pool = self._pool(state.season, state.scoring_mode)
         if action == GameAction.REROLL_TEAM:
             result = self._reroll_team(state, pool)
             new_pick = None
@@ -323,17 +349,34 @@ class RosterGameService:
     def can_reroll_team(self, state: RosterGameState) -> bool:
         if state.team_reroll_used or state.pending is None:
             return False
-        return bool(self._team_alternatives(state, self._pool(state.season)))
+        return bool(
+            self._team_alternatives(
+                state,
+                self._pool(state.season, state.scoring_mode),
+            )
+        )
 
     def can_reroll_position(self, state: RosterGameState) -> bool:
         if state.position_reroll_used or state.pending is None:
             return False
-        return bool(self._position_alternatives(state, self._pool(state.season)))
+        return bool(
+            self._position_alternatives(
+                state,
+                self._pool(state.season, state.scoring_mode),
+            )
+        )
 
-    def _pool(self, season: int) -> tuple[PlayerPoolEntry, ...]:
-        if season not in self._pool_cache:
-            self._pool_cache[season] = tuple(self.repository.player_pool(season))
-        return self._pool_cache[season]
+    def _pool(
+        self,
+        season: int,
+        scoring_mode: GameScoringMode,
+    ) -> tuple[PlayerPoolEntry, ...]:
+        key = (season, scoring_mode)
+        if key not in self._pool_cache:
+            self._pool_cache[key] = tuple(
+                self.repository.player_pool(season, scoring_mode)
+            )
+        return self._pool_cache[key]
 
     def _new_roll(
         self,
@@ -521,7 +564,7 @@ class RosterGameService:
         picks = (*state.picks, pick)
         if len(picks) == len(ROSTER_SLOTS):
             total = round(sum(value.player.fantasy_points_ppr for value in picks), 2)
-            wins = wins_for_score(total)
+            wins = wins_for_score(total, state.scoring_mode)
             completed = replace(
                 state,
                 status=GameStatus.COMPLETED,

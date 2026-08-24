@@ -9,6 +9,7 @@ from services.roster_game import (
     GameAction,
     GameOutcome,
     GameResult,
+    GameScoringMode,
     GameStatus,
     ROSTER_SLOTS,
     RosterGameService,
@@ -22,6 +23,7 @@ GAME_CUSTOM_ID_PREFIX = "magiff_game"
 @dataclass(frozen=True)
 class GameStartQuery:
     season: int | None = None
+    scoring_mode: GameScoringMode = GameScoringMode.SEASON_TOTAL
     reveal_during_roll: bool = False
 
 
@@ -49,20 +51,26 @@ def extract_game_start(payload: dict[str, Any]) -> GameStartQuery:
     for option in raw_values:
         if not isinstance(option, dict) or option.get("name") not in {
             "season",
+            "scoring",
             "reveal",
         }:
             raise ValueError("Discord supplied an unsupported game option.")
         values[str(option["name"])] = option.get("value")
 
     season = values.get("season")
+    scoring = values.get("scoring", GameScoringMode.SEASON_TOTAL.value)
     reveal = values.get("reveal", False)
     if season is not None and (isinstance(season, bool) or not isinstance(season, int)):
         raise ValueError("season must be a four-digit NFL season.")
     if season is not None and not 1999 <= season <= 2100:
         raise ValueError("season must be between 1999 and 2100.")
+    try:
+        scoring_mode = GameScoringMode(str(scoring))
+    except ValueError as error:
+        raise ValueError("scoring must be season totals or PPR PPG.") from error
     if not isinstance(reveal, bool):
         raise ValueError("reveal must be true or false.")
-    return GameStartQuery(season, reveal)
+    return GameStartQuery(season, scoring_mode, reveal)
 
 
 def extract_game_component(payload: dict[str, Any]) -> GameComponent:
@@ -107,12 +115,14 @@ def _slot_value(state: RosterGameState, slot) -> str:
     if state.reveal_during_roll or state.status == GameStatus.COMPLETED:
         return (
             f"{pick.player.display_name} ({pick.player.team}) - "
-            f"{pick.player.fantasy_points_ppr:.1f} PPR"
+            f"{pick.player.fantasy_points_ppr:.1f} "
+            f"{'PPR PPG' if state.scoring_mode == GameScoringMode.PPG else 'PPR'}"
         )
     if state.status == GameStatus.ABANDONED:
         return (
             f"{pick.player.display_name} ({pick.player.team}) - "
-            f"{pick.player.fantasy_points_ppr:.1f} PPR"
+            f"{pick.player.fantasy_points_ppr:.1f} "
+            f"{'PPR PPG' if state.scoring_mode == GameScoringMode.PPG else 'PPR'}"
         )
     return f"{pick.player.team} 🔒"
 
@@ -165,22 +175,37 @@ def _embed(state: RosterGameState) -> list[dict[str, object]]:
             f"{player.team} - {position_label}"
         )
         if state.reveal_during_roll:
+            metric = (
+                "PPR PPG"
+                if state.scoring_mode == GameScoringMode.PPG
+                else "season PPR"
+            )
             lines.append(
                 f"**{player.display_name}** - "
-                f"{player.fantasy_points_ppr:.1f} season PPR"
+                f"{player.fantasy_points_ppr:.1f} {metric}"
             )
         else:
             lines.append("Player and points hidden until the final roster.")
     elif state.status == GameStatus.COMPLETED:
         player = None
+        metric = (
+            "PPR PPG"
+            if state.scoring_mode == GameScoringMode.PPG
+            else "PPR"
+        )
         title = (
-            f"Final - {state.total_points:,.1f} PPR - "
+            f"Final - {state.total_points:,.1f} {metric} - "
             f"{state.wins}-{state.losses}"
         )
     else:
         player = None
         title = f"Run Forfeited - {len(state.picks)}/{len(ROSTER_SLOTS)} picks"
-        lines.append(f"Saved subtotal: **{state.total_points:,.1f} PPR**")
+        metric = (
+            "PPR PPG"
+            if state.scoring_mode == GameScoringMode.PPG
+            else "PPR"
+        )
+        lines.append(f"Saved subtotal: **{state.total_points:,.1f} {metric}**")
 
     embed: dict[str, object] = {
         "title": title,
@@ -276,7 +301,10 @@ def format_game_state(
         description = str(embed.get("description") or "")
         embed["description"] = f"**{note}**\n{description}"
     return {
-        "content": f"## 17-0 Challenge - {state.season}",
+        "content": (
+            f"## 17-0 Challenge - {state.season} - "
+            f"{'PPR PPG' if state.scoring_mode == GameScoringMode.PPG else 'Season Total'}"
+        ),
         "embeds": [embed],
         "components": _components(state, game_service),
         "allowed_mentions": {"parse": []},

@@ -8,7 +8,7 @@ The backend has four independent entry points:
   ingestion remains in GitHub Actions and is not started by the API server.
 - `python -m jobs.register_discord_commands` registers private Discord command
   profiles. The test guild gets `/ask`, `/news`, `/stats`, and `/game`; UAI gets
-  only `/news` and `/stats`.
+  `/news`, `/stats`, and `/game`.
 
 ## Local API
 
@@ -91,13 +91,14 @@ Discord calls `POST /v1/discord/interactions` directly. That route does not use
 `MAGIFF_API_KEY`; it verifies Discord's Ed25519 request signature, restricts
 commands to the enabled test/UAI guild allowlist, immediately shows the quoted
 question and a thinking indicator, and edits that message after MAGIFF finishes.
-The test guild can use every command; UAI gets only `/news` and `/stats` and can
-be disabled independently. `/ask` runs
+The test guild can use every command; UAI gets `/news`, `/stats`, and `/game`
+and can be disabled independently. `/ask` runs
 the agent; `/news` performs a deterministic newest-first report read, while
 `/stats` performs deterministic structured lookup and safe formula analytics
-with native field autocomplete. Test-only `/game challenge` runs the
-deterministic, button-driven 17-0 Challenge and persists users, sessions,
-picks, and actions in Supabase. None of the direct commands invokes an LLM.
+with native field autocomplete. `/game challenge` runs the deterministic,
+button-driven 17-0 Challenge in either season-total or PPR-PPG mode and persists
+users, sessions, picks, and actions in Supabase. None of the direct commands
+invokes an LLM.
 See the complete parameter and retry reference in
 [`integrations/README.md`](integrations/README.md).
 
@@ -134,7 +135,7 @@ After Render deploys the Discord code:
 
 Commands are registered at guild scope, so changes appear quickly and they are
 not published globally. The registration job installs `/ask`, `/news`, `/stats`,
-and `/game` in the test guild, but only `/news` and `/stats` in UAI. Setting
+and `/game` in the test guild, but `/news`, `/stats`, and `/game` in UAI. Setting
 `DISCORD_UAI_ENABLED=false` blocks execution there without deleting its visible
 commands. Render's free service can sleep; a cold start may miss
 Discord's three-second acknowledgement deadline. Wake `/health` before a demo.

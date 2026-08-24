@@ -210,8 +210,18 @@ GAME_COMMAND = {
                     "max_value": 2100,
                 },
                 {
+                    "name": "scoring",
+                    "description": "Season PPR total (default) or PPR points per game",
+                    "type": 3,
+                    "required": False,
+                    "choices": [
+                        {"name": "Season total", "value": "season_total"},
+                        {"name": "PPR points per game", "value": "ppg"},
+                    ],
+                },
+                {
                     "name": "reveal",
-                    "description": "Show each player and PPR total during rolls (default false)",
+                    "description": "Show each player and score during rolls (default false)",
                     "type": 5,
                     "required": False,
                 },
@@ -221,7 +231,7 @@ GAME_COMMAND = {
 }
 
 TEST_COMMANDS = (ASK_COMMAND, NEWS_COMMAND, STATS_COMMAND, GAME_COMMAND)
-UAI_COMMANDS = (NEWS_COMMAND, STATS_COMMAND)
+UAI_COMMANDS = (NEWS_COMMAND, STATS_COMMAND, GAME_COMMAND)
 # Backwards-compatible name for callers that expect the full command catalog.
 DISCORD_COMMANDS = TEST_COMMANDS
 

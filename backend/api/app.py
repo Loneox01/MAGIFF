@@ -355,10 +355,10 @@ def create_app(
         claimed = interaction_ids.claim(interaction_id)
         suppress_embeds = False
         if interaction_type == MESSAGE_COMPONENT_INTERACTION:
-            if guild_profile != "test" or discord_game_service is None:
+            if guild_profile not in {"test", "uai"} or discord_game_service is None:
                 return JSONResponse(
                     discord_message(
-                        "The 17-0 Challenge is only enabled in MAGIFF's test server."
+                        "The 17-0 Challenge is not enabled in this server."
                     )
                 )
             try:
@@ -460,10 +460,10 @@ def create_app(
                 )
             content = format_stats_pending(stats_query)
         elif command_name == "game" and discord_game_service is not None:
-            if guild_profile != "test":
+            if guild_profile not in {"test", "uai"}:
                 return JSONResponse(
                     discord_message(
-                        "`/game` is only enabled in MAGIFF's test server."
+                        "`/game` is not enabled in this server."
                     )
                 )
             if not claimed:
@@ -480,6 +480,7 @@ def create_app(
                     display_name=display_name,
                     discord_guild_id=guild_id,
                     season=game_query.season,
+                    scoring_mode=game_query.scoring_mode,
                     reveal_during_roll=game_query.reveal_during_roll,
                 )
             except ValueError as error:

@@ -372,6 +372,7 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(response.json()["type"], 4)
         data = response.json()["data"]
         self.assertIn("17-0 Challenge", data["content"])
+        self.assertIn("Season Total", data["content"])
         self.assertIn(
             "Player and points hidden",
             data["embeds"][0]["description"],
@@ -427,6 +428,21 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(advanced.json()["type"], 7)
         self.assertIn("17-0 Challenge", advanced.json()["data"]["content"])
 
+    def test_game_supports_ppg_scoring_mode(self) -> None:
+        payload = self.game_payload(interaction_id="ppg-game")
+        payload["data"]["options"][0]["options"] = [
+            {"name": "scoring", "type": 3, "value": "ppg"},
+            {"name": "reveal", "type": 5, "value": True},
+        ]
+
+        response = self.signed_post(payload)
+
+        data = response.json()["data"]
+        self.assertIn("PPR PPG", data["content"])
+        self.assertIn("PPR PPG", data["embeds"][0]["description"])
+        state = next(iter(self.game_repository.games.values()))
+        self.assertEqual(state.scoring_mode.value, "ppg")
+
     def test_game_forfeit_ends_run_and_removes_buttons(self) -> None:
         started = self.signed_post(self.game_payload()).json()
         forfeit_button = started["data"]["components"][0]["components"][3]
@@ -458,14 +474,23 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(response.json()["data"]["flags"], 64)
         self.assertIn("Only the player", response.json()["data"]["content"])
 
-    def test_uai_profile_rejects_game(self) -> None:
+    def test_uai_profile_allows_game_and_component_actions(self) -> None:
         payload = self.game_payload(interaction_id="uai-game")
         payload["guild_id"] = UAI_GUILD_ID
 
-        response = self.signed_post(payload)
+        started = self.signed_post(payload).json()
+        lock_button = started["data"]["components"][0]["components"][2]
+        payload["id"] = "uai-game-lock"
+        payload["type"] = 3
+        payload["data"] = {
+            "component_type": 2,
+            "custom_id": lock_button["custom_id"],
+        }
+        advanced = self.signed_post(payload)
 
-        self.assertIn("only enabled", response.json()["data"]["content"])
-        self.assertEqual(self.game_repository.games, {})
+        self.assertEqual(started["type"], 4)
+        self.assertEqual(advanced.json()["type"], 7)
+        self.assertEqual(len(self.game_repository.games), 1)
 
     def test_disabled_uai_profile_rejects_commands(self) -> None:
         self.client.app.state.settings.discord_uai_enabled = False
@@ -745,15 +770,20 @@ class DiscordCommandRegistrationTests(unittest.TestCase):
         self.assertTrue(leader_options["minimum_field"]["autocomplete"])
         self.assertNotIn("choices", leader_options["formula"])
 
-    def test_game_command_is_one_challenge_subcommand_with_optional_reveal(self) -> None:
+    def test_game_command_has_scoring_and_reveal_options(self) -> None:
         self.assertEqual(GAME_COMMAND["options"][0]["name"], "challenge")
         options = {
             option["name"]: option
             for option in GAME_COMMAND["options"][0]["options"]
         }
-        self.assertEqual(set(options), {"season", "reveal"})
+        self.assertEqual(set(options), {"season", "scoring", "reveal"})
         self.assertFalse(options["season"]["required"])
+        self.assertFalse(options["scoring"]["required"])
         self.assertFalse(options["reveal"]["required"])
+        self.assertEqual(
+            {choice["value"] for choice in options["scoring"]["choices"]},
+            {"season_total", "ppg"},
+        )
 
     def test_test_and_uai_command_buckets_are_intentionally_different(self) -> None:
         self.assertEqual(
@@ -762,7 +792,7 @@ class DiscordCommandRegistrationTests(unittest.TestCase):
         )
         self.assertEqual(
             {command["name"] for command in UAI_COMMANDS},
-            {"news", "stats"},
+            {"news", "stats", "game"},
         )
 
 

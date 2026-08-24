@@ -6,6 +6,7 @@ from services.roster_game import (
     GameAction,
     GameOutcome,
     GamePick,
+    GameScoringMode,
     GameStatus,
     PlayerPoolEntry,
     RosterSlot,
@@ -38,7 +39,7 @@ class FakeRosterGameRepository:
     def latest_completed_season(self):
         return 2025
 
-    def player_pool(self, season):
+    def player_pool(self, season, scoring_mode):
         return list(self.pool) if season == 2025 else []
 
     def season_is_complete(self, season):
@@ -230,6 +231,17 @@ class RosterGameServiceTests(unittest.TestCase):
         self.assertEqual(result.outcome, GameOutcome.SEASON_UNAVAILABLE)
         self.assertEqual(self.repository.games, {})
 
+    def test_ppg_mode_is_persisted_on_the_game(self) -> None:
+        result = self.service.start(
+            discord_user_id="123",
+            display_name="Tester",
+            discord_guild_id="guild",
+            scoring_mode=GameScoringMode.PPG,
+        )
+
+        self.assertEqual(result.outcome, GameOutcome.READY)
+        self.assertEqual(result.state.scoring_mode, GameScoringMode.PPG)
+
     def test_record_scale_has_padded_extremes(self) -> None:
         self.assertEqual(wins_for_score(800), 0)
         self.assertEqual(wins_for_score(850), 1)
@@ -238,6 +250,9 @@ class RosterGameServiceTests(unittest.TestCase):
         self.assertEqual(wins_for_score(2_200), 15)
         self.assertEqual(wins_for_score(2_250), 16)
         self.assertEqual(wins_for_score(2_300), 17)
+        self.assertEqual(wins_for_score(800 / 17, GameScoringMode.PPG), 0)
+        self.assertEqual(wins_for_score(1_500 / 17, GameScoringMode.PPG), 8)
+        self.assertEqual(wins_for_score(2_300 / 17, GameScoringMode.PPG), 17)
 
 
 if __name__ == "__main__":

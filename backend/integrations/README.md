@@ -10,10 +10,9 @@ Discord slash-command parameters are separate form fields presented by Discord.
 Users do not need to remember comma-separated text or manually parse a command
 string.
 
-The test guild receives all commands. The UAI friends guild receives the stable
-`/news` and `/stats` subset; its runtime access can be toggled independently
-with `DISCORD_UAI_ENABLED`. The 17-0 Challenge remains test-only while its rules
-and scoring are calibrated.
+The test guild receives all commands. The UAI friends guild receives `/news`,
+`/stats`, and the 17-0 Challenge; its runtime access can be toggled independently
+with `DISCORD_UAI_ENABLED`. `/ask` remains test-only.
 
 ### `/ask`
 
@@ -101,11 +100,13 @@ RB, WR, or TE only after that position's ordinary roster slot or slots are full.
 /game challenge
 /game challenge season:2024
 /game challenge season:2025 reveal:true
+/game challenge season:2025 scoring:ppg
 ```
 
 | Option | Required | Accepted value | Default |
 |---|---:|---|---|
 | `season` | No | A stored completed NFL season | Latest stored season |
+| `scoring` | No | `season_total` or `ppg` | `season_total` |
 | `reveal` | No | `true` or `false` | `false` |
 
 The lineup is QB, two RBs, two WRs, one TE, and one FLEX. Accepted teams and
@@ -113,12 +114,17 @@ players cannot repeat. Every game has one team reroll and one position reroll;
 the corresponding button is disabled after use. The red forfeit button ends
 the run and reveals its saved picks. Hidden mode shows only the
 rolled team and position until the final reveal, while `reveal:true` also shows
-the player and season PPR total during each roll. The current team logo appears
+the player and selected score during each roll. The current team logo appears
 in the roll card.
 
-The final total maps to a 0–17 through 17–0 record using padded score anchors:
+Season-total mode selects each team-position's highest full-season PPR scorer.
+PPG mode instead selects its highest PPR average across that player's stored
+stat-row games for the team. The default remains season totals.
+
+The season total maps to a 0–17 through 17–0 record using padded score anchors:
 800, 850, 900, 100-point middle steps through 2,200, then 2,250 and 2,300. The
-closest anchor determines the record, with exact ties favoring the lower one.
+PPG mode uses those same anchors divided by 17. The closest anchor determines
+the record, with exact ties favoring the lower one.
 Sessions, picks, users, and actions persist in Supabase; versioned buttons and
 database constraints reject stale clicks, duplicate deliveries, and repeated
 teams or players.

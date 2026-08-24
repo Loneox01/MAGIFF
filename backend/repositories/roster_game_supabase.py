@@ -6,6 +6,7 @@ from database.client import get_supabase_client
 from services.roster_game import (
     GameAction,
     GamePick,
+    GameScoringMode,
     GameStatus,
     PlayerPoolEntry,
     RolledPlayer,
@@ -102,10 +103,17 @@ class SupabaseRosterGameRepository:
         )
         return bool(rows)
 
-    def player_pool(self, season: int) -> list[PlayerPoolEntry]:
+    def player_pool(
+        self,
+        season: int,
+        scoring_mode: GameScoringMode,
+    ) -> list[PlayerPoolEntry]:
         rows = self.client.rpc(
-            "get_roster_game_pool",
-            {"target_season": season},
+            "get_roster_game_pool_v2",
+            {
+                "target_season": season,
+                "target_scoring_mode": scoring_mode.value,
+            },
         ).execute().data
         return [
             PlayerPoolEntry(
@@ -150,6 +158,7 @@ class SupabaseRosterGameRepository:
                 "discord_user_id": state.discord_user_id,
                 "discord_guild_id": state.discord_guild_id,
                 "season": state.season,
+                "scoring_mode": state.scoring_mode.value,
                 "reveal_during_roll": state.reveal_during_roll,
                 "status": state.status.value,
                 "pending_pick": _rolled_payload(state.pending),
@@ -193,6 +202,9 @@ class SupabaseRosterGameRepository:
             discord_user_id=str(row["discord_user_id"]),
             discord_guild_id=str(row["discord_guild_id"]),
             season=int(row["season"]),
+            scoring_mode=GameScoringMode(
+                str(row.get("scoring_mode") or GameScoringMode.SEASON_TOTAL.value)
+            ),
             reveal_during_roll=bool(row["reveal_during_roll"]),
             status=GameStatus(str(row["status"])),
             pending=_rolled_from_payload(row.get("pending_pick")),
