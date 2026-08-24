@@ -194,11 +194,11 @@ STATS_COMMAND = {
 GAME_COMMAND = {
     "name": "game",
     "type": 1,
-    "description": "Play MAGIFF fantasy-football games",
+    "description": "Play the MAGIFF 17-0 Challenge",
     "options": [
         {
-            "name": "roster",
-            "description": "Build a seven-player roster from team and position rolls",
+            "name": "challenge",
+            "description": "Build a seven-player roster and chase a 17-0 record",
             "type": 1,
             "options": [
                 {

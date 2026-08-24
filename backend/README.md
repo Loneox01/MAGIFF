@@ -95,10 +95,11 @@ The test guild can use every command; UAI gets only `/news` and `/stats` and can
 be disabled independently. `/ask` runs
 the agent; `/news` performs a deterministic newest-first report read, while
 `/stats` performs deterministic structured lookup and safe formula analytics
-with native field autocomplete. Test-only `/game roster` runs a deterministic,
-button-driven roster game and persists users, sessions, picks, and actions in
-Supabase. None of the direct commands invokes an LLM. See the complete parameter and retry
-reference in [`integrations/README.md`](integrations/README.md).
+with native field autocomplete. Test-only `/game challenge` runs the
+deterministic, button-driven 17-0 Challenge and persists users, sessions,
+picks, and actions in Supabase. None of the direct commands invokes an LLM.
+See the complete parameter and retry reference in
+[`integrations/README.md`](integrations/README.md).
 
 Add these runtime variables to Render alongside the existing API variables:
 
@@ -129,7 +130,7 @@ After Render deploys the Discord code:
    ```
 
 4. Install the application in the configured server if it is not already
-   installed, then run `/ask`, `/news`, `/stats`, or `/game roster` there.
+   installed, then run `/ask`, `/news`, `/stats`, or `/game challenge` there.
 
 Commands are registered at guild scope, so changes appear quickly and they are
 not published globally. The registration job installs `/ask`, `/news`, `/stats`,

@@ -12,7 +12,7 @@ string.
 
 The test guild receives all commands. The UAI friends guild receives the stable
 `/news` and `/stats` subset; its runtime access can be toggled independently
-with `DISCORD_UAI_ENABLED`. Roster roulette remains test-only while its rules
+with `DISCORD_UAI_ENABLED`. The 17-0 Challenge remains test-only while its rules
 and scoring are calibrated.
 
 ### `/ask`
@@ -90,17 +90,17 @@ submitted formula because Discord permits arbitrary text. Omitting `season`
 selects the latest stored season available for that query. Player and team
 names use the same conservative resolution and ambiguity punts as `/news`.
 
-### `/game roster`
+### `/game challenge`
 
-Starts a seven-pick roster-roulette game without invoking an LLM. Each roll
+Starts the seven-pick 17-0 Challenge without invoking an LLM. Each roll
 selects an unused NFL team and one open roster slot. The season's highest PPR
 scorer for that team and position is attached to the roll. FLEX resolves to an
-RB, WR, or TE.
+RB, WR, or TE only after that position's ordinary roster slot or slots are full.
 
 ```text
-/game roster
-/game roster season:2024
-/game roster season:2025 reveal:true
+/game challenge
+/game challenge season:2024
+/game challenge season:2025 reveal:true
 ```
 
 | Option | Required | Accepted value | Default |
@@ -110,7 +110,8 @@ RB, WR, or TE.
 
 The lineup is QB, two RBs, two WRs, one TE, and one FLEX. Accepted teams and
 players cannot repeat. Every game has one team reroll and one position reroll;
-the corresponding button is disabled after use. Hidden mode shows only the
+the corresponding button is disabled after use. The red forfeit button ends
+the run and reveals its saved picks. Hidden mode shows only the
 rolled team and position until the final reveal, while `reveal:true` also shows
 the player and season PPR total during each roll. The current team logo appears
 in the roll card.

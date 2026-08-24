@@ -1,4 +1,4 @@
-"""Deterministic roster-roulette game used by Discord clients."""
+"""Deterministic 17-0 Challenge game used by Discord clients."""
 
 from __future__ import annotations
 
@@ -29,6 +29,11 @@ ROSTER_SLOTS = (
     RosterSlot.FLEX,
 )
 FLEX_POSITIONS = ("RB", "WR", "TE")
+BASE_SLOTS_BY_POSITION = {
+    "RB": (RosterSlot.RB1, RosterSlot.RB2),
+    "WR": (RosterSlot.WR1, RosterSlot.WR2),
+    "TE": (RosterSlot.TE,),
+}
 
 # Each index is a win total. The closer anchor wins; ties favor the lower
 # record. Two 50-point steps pad each tail and the middle uses 100-point steps.
@@ -64,12 +69,14 @@ class GameAction(StrEnum):
     LOCK = "lock"
     REROLL_TEAM = "reroll_team"
     REROLL_POSITION = "reroll_position"
+    FORFEIT = "forfeit"
 
 
 class GameOutcome(StrEnum):
     READY = "ready"
     UPDATED = "updated"
     COMPLETED = "completed"
+    FORFEITED = "forfeited"
     STALE = "stale"
     NOT_OWNER = "not_owner"
     NOT_FOUND = "not_found"
@@ -284,12 +291,16 @@ class RosterGameService:
         elif action == GameAction.REROLL_POSITION:
             result = self._reroll_position(state, pool)
             new_pick = None
+        elif action == GameAction.FORFEIT:
+            result = self._forfeit(state)
+            new_pick = None
         else:
             result, new_pick = self._lock(state, pool)
 
         if result.outcome not in {
             GameOutcome.UPDATED,
             GameOutcome.COMPLETED,
+            GameOutcome.FORFEITED,
         }:
             return result
         assert result.state is not None
@@ -330,14 +341,14 @@ class RosterGameService:
         picks: Sequence[GamePick],
         excluded_slots: Sequence[RosterSlot],
     ) -> RolledPlayer | None:
-        used_slots = {pick.roster_slot for pick in picks} | set(excluded_slots)
         used_teams = {pick.player.team for pick in picks}
         used_players = {pick.player.player_id for pick in picks}
         combinations = [
             (slot, position)
-            for slot in ROSTER_SLOTS
-            if slot not in used_slots
-            for position in position_choices(slot)
+            for slot, position in self._available_slot_positions(
+                picks,
+                excluded_slots,
+            )
             if any(
                 entry.position == position
                 and entry.team not in used_teams
@@ -365,6 +376,32 @@ class RosterGameService:
         ]
         return RolledPlayer(slot, self.rng.choice(candidates))
 
+    @staticmethod
+    def _available_slot_positions(
+        picks: Sequence[GamePick],
+        excluded_slots: Sequence[RosterSlot] = (),
+    ) -> list[tuple[RosterSlot, str]]:
+        used_slots = {pick.roster_slot for pick in picks} | set(excluded_slots)
+        combinations: list[tuple[RosterSlot, str]] = []
+        for slot in ROSTER_SLOTS:
+            if slot in used_slots:
+                continue
+            if slot != RosterSlot.FLEX:
+                combinations.extend(
+                    (slot, position) for position in position_choices(slot)
+                )
+                continue
+            # FLEX becomes eligible for a position only after every base slot
+            # for that position is occupied. This prevents an early FLEX roll
+            # from bypassing an available RB, WR, or TE slot.
+            for position in FLEX_POSITIONS:
+                if all(
+                    base_slot in used_slots
+                    for base_slot in BASE_SLOTS_BY_POSITION[position]
+                ):
+                    combinations.append((slot, position))
+        return combinations
+
     def _team_alternatives(
         self,
         state: RosterGameState,
@@ -387,7 +424,6 @@ class RosterGameService:
         pool: Sequence[PlayerPoolEntry],
     ) -> list[RolledPlayer]:
         assert state.pending is not None
-        used_slots = {pick.roster_slot for pick in state.picks}
         used_players = {pick.player.player_id for pick in state.picks}
         current_position = state.pending.player.position
         entries = {
@@ -397,11 +433,27 @@ class RosterGameService:
         }
         return [
             RolledPlayer(slot, entries[position])
-            for slot in ROSTER_SLOTS
-            if slot not in used_slots
-            for position in position_choices(slot)
+            for slot, position in self._available_slot_positions(state.picks)
             if position != current_position and position in entries
         ]
+
+    @staticmethod
+    def _forfeit(state: RosterGameState) -> GameResult:
+        total = round(
+            sum(pick.player.fantasy_points_ppr for pick in state.picks),
+            2,
+        )
+        forfeited = replace(
+            state,
+            status=GameStatus.ABANDONED,
+            pending=None,
+            total_points=total,
+            version=state.version + 1,
+        )
+        return GameResult(
+            GameOutcome.FORFEITED,
+            forfeited,
+        )
 
     def _reroll_team(
         self,
@@ -491,4 +543,4 @@ class RosterGameService:
             pending=pending,
             version=state.version + 1,
         )
-        return GameResult(GameOutcome.UPDATED, updated, "Player locked."), pick
+        return GameResult(GameOutcome.UPDATED, updated), pick

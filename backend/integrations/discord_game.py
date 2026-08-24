@@ -1,4 +1,4 @@
-"""Discord UI and payload parsing for roster roulette."""
+"""Discord UI and payload parsing for the 17-0 Challenge."""
 
 from __future__ import annotations
 
@@ -38,10 +38,10 @@ def extract_game_start(payload: dict[str, Any]) -> GameStartQuery:
         raise ValueError("Interaction is not the /game command")
     options = data.get("options", [])
     if not isinstance(options, list) or len(options) != 1:
-        raise ValueError("Use `/game roster` to start roster roulette.")
+        raise ValueError("Use `/game challenge` to start the 17-0 Challenge.")
     subcommand = options[0]
-    if not isinstance(subcommand, dict) or subcommand.get("name") != "roster":
-        raise ValueError("Use `/game roster` to start roster roulette.")
+    if not isinstance(subcommand, dict) or subcommand.get("name") != "challenge":
+        raise ValueError("Use `/game challenge` to start the 17-0 Challenge.")
     raw_values = subcommand.get("options", [])
     if not isinstance(raw_values, list):
         raise ValueError("Discord supplied invalid game options.")
@@ -100,51 +100,96 @@ def discord_user(payload: dict[str, Any]) -> tuple[str, str | None]:
     return str(user["id"]), display_name
 
 
-def _slot_label(state: RosterGameState, slot) -> str:
+def _slot_value(state: RosterGameState, slot) -> str:
     pick = next((value for value in state.picks if value.roster_slot == slot), None)
     if pick is None:
-        return f"- **{slot.value}:** —"
+        return "-"
     if state.reveal_during_roll or state.status == GameStatus.COMPLETED:
         return (
-            f"- **{slot.value}:** {pick.player.display_name} "
-            f"({pick.player.team}) — {pick.player.fantasy_points_ppr:.1f} PPR"
+            f"{pick.player.display_name} ({pick.player.team}) - "
+            f"{pick.player.fantasy_points_ppr:.1f} PPR"
         )
-    return f"- **{slot.value}:** {pick.player.team} — locked"
+    if state.status == GameStatus.ABANDONED:
+        return (
+            f"{pick.player.display_name} ({pick.player.team}) - "
+            f"{pick.player.fantasy_points_ppr:.1f} PPR"
+        )
+    return f"{pick.player.team} 🔒"
 
 
-def _current_roll(state: RosterGameState) -> list[str]:
-    assert state.pending is not None
-    pending = state.pending
-    position = pending.player.position
-    label = (
-        f"{pending.roster_slot.value} ({position})"
-        if pending.roster_slot.value == "FLEX"
-        else position
-    )
-    lines = [
-        f"### Roll {len(state.picks) + 1} of {len(ROSTER_SLOTS)}",
-        f"**{pending.player.team} · {label}**",
+def _roster_lines(state: RosterGameState) -> list[str]:
+    if state.status == GameStatus.ACTIVE and not state.reveal_during_roll:
+        pairs = (
+            (ROSTER_SLOTS[0], ROSTER_SLOTS[5]),
+            (ROSTER_SLOTS[1], ROSTER_SLOTS[3]),
+            (ROSTER_SLOTS[2], ROSTER_SLOTS[4]),
+            (ROSTER_SLOTS[6], None),
+        )
+        lines = []
+        for left, right in pairs:
+            left_cell = f"`{left.value:<5} {_slot_value(state, left):<8}`"
+            right_cell = (
+                ""
+                if right is None
+                else f"  `{right.value:<5} {_slot_value(state, right):<8}`"
+            )
+            lines.append(left_cell + right_cell)
+        return lines
+    return [
+        f"**{slot.value}** - {_slot_value(state, slot)}"
+        for slot in ROSTER_SLOTS
     ]
-    if state.reveal_during_roll:
-        lines.append(
-            f"**{pending.player.display_name}** — "
-            f"{pending.player.fantasy_points_ppr:.1f} season PPR points"
-        )
-    else:
-        lines.append("Player and points are hidden until the final roster.")
-    return lines
 
 
 def _embed(state: RosterGameState) -> list[dict[str, object]]:
-    if state.pending is None:
-        return []
-    player = state.pending.player
+    lines: list[str] = []
+    if state.status == GameStatus.ACTIVE:
+        assert state.pending is not None
+        player = state.pending.player
+        position_label = (
+            f"FLEX ({player.position})"
+            if state.pending.roster_slot.value == "FLEX"
+            else player.position
+        )
+        title = (
+            f"Roll {len(state.picks) + 1}/{len(ROSTER_SLOTS)} - "
+            f"{player.team} - {position_label}"
+        )
+        if state.reveal_during_roll:
+            lines.append(
+                f"**{player.display_name}** - "
+                f"{player.fantasy_points_ppr:.1f} season PPR"
+            )
+        else:
+            lines.append("*Player and points hidden until the final roster.*")
+    elif state.status == GameStatus.COMPLETED:
+        player = None
+        title = (
+            f"Final - {state.total_points:,.1f} PPR - "
+            f"{state.wins}-{state.losses}"
+        )
+    else:
+        player = None
+        title = f"Run Forfeited - {len(state.picks)}/{len(ROSTER_SLOTS)} picks"
+        lines.append(f"Saved subtotal: **{state.total_points:,.1f} PPR**")
+
+    lines.extend(["**Roster**", *_roster_lines(state)])
     embed: dict[str, object] = {
-        "title": f"{player.team} — {player.team_name}",
+        "title": title,
+        "description": "\n".join(lines),
     }
-    if player.team_logo_url:
+    if state.status == GameStatus.ACTIVE:
+        embed["footer"] = {
+            "text": (
+                "Team reroll: "
+                f"{'used' if state.team_reroll_used else 'available'} | "
+                "Position reroll: "
+                f"{'used' if state.position_reroll_used else 'available'}"
+            )
+        }
+    if player is not None and player.team_logo_url:
         embed["thumbnail"] = {"url": player.team_logo_url}
-    if player.team_color:
+    if player is not None and player.team_color:
         value = player.team_color.strip().lstrip("#")
         try:
             embed["color"] = int(value, 16)
@@ -196,6 +241,12 @@ def _components(
                     ),
                     "custom_id": _custom_id(state, GameAction.LOCK),
                 },
+                {
+                    "type": 2,
+                    "style": 4,
+                    "label": "Forfeit Run",
+                    "custom_id": _custom_id(state, GameAction.FORFEIT),
+                },
             ],
         }
     ]
@@ -207,41 +258,13 @@ def format_game_state(
     *,
     note: str | None = None,
 ) -> dict[str, object]:
-    lines = [f"## Roster Roulette · {state.season}"]
+    embed = _embed(state)[0]
     if note:
-        lines.append(f"*{note}*")
-    if state.status == GameStatus.ACTIVE:
-        lines.extend(["", *_current_roll(state)])
-    else:
-        lines.extend(
-            [
-                "",
-                "### Final Result",
-                f"**{state.total_points:,.1f} PPR points**",
-                f"## {state.wins}–{state.losses}",
-            ]
-        )
-    lines.extend(["", "### Roster"])
-    lines.extend(_slot_label(state, slot) for slot in ROSTER_SLOTS)
-    if state.status == GameStatus.ACTIVE:
-        lines.extend(
-            [
-                "",
-                (
-                    "Team reroll: **used**"
-                    if state.team_reroll_used
-                    else "Team reroll: **available**"
-                ),
-                (
-                    "Position reroll: **used**"
-                    if state.position_reroll_used
-                    else "Position reroll: **available**"
-                ),
-            ]
-        )
+        description = str(embed.get("description") or "")
+        embed["description"] = f"*{note}*\n{description}"
     return {
-        "content": "\n".join(lines),
-        "embeds": _embed(state),
+        "content": f"## 17-0 Challenge - {state.season}",
+        "embeds": [embed],
         "components": _components(state, game_service),
         "allowed_mentions": {"parse": []},
     }
@@ -250,15 +273,15 @@ def format_game_state(
 def format_game_error(result: GameResult) -> str:
     mapping = {
         GameOutcome.NOT_FOUND: (
-            "That roster game no longer exists. Start another with `/game roster`."
+            "That challenge no longer exists. Start another with `/game challenge`."
         ),
         GameOutcome.NOT_OWNER: "Only the player who started this game can use its buttons.",
-        GameOutcome.ALREADY_COMPLETE: "That roster game is already complete.",
+        GameOutcome.ALREADY_COMPLETE: "That challenge is already finished.",
         GameOutcome.REROLL_USED: result.note or "That reroll has already been used.",
         GameOutcome.REROLL_UNAVAILABLE: result.note or "That reroll is unavailable.",
         GameOutcome.SEASON_UNAVAILABLE: result.note or "That season is unavailable.",
     }
-    return "## Roster Roulette\n" + mapping.get(
+    return "## 17-0 Challenge\n" + mapping.get(
         result.outcome,
         result.note or "The game could not be updated. Retry in a moment.",
     )

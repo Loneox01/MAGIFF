@@ -1,4 +1,4 @@
--- Persistent application identities and the Discord roster-roulette game.
+-- Persistent application identities and the Discord 17-0 Challenge.
 -- The backend secret-key client owns all access; no anonymous policies exist.
 
 create table public.app_users (
@@ -157,7 +157,7 @@ create table public.roster_game_actions (
     created_at timestamp with time zone not null default now(),
 
     constraint roster_game_actions_action_check
-        check (action in ('lock', 'reroll_team', 'reroll_position'))
+        check (action in ('lock', 'reroll_team', 'reroll_position', 'forfeit'))
 );
 
 create index roster_game_actions_game_idx
@@ -302,7 +302,7 @@ begin
            version = p_expected_version + 1,
            updated_at = now(),
            completed_at = case
-               when p_status = 'completed' then now()
+               when p_status in ('completed', 'abandoned') then now()
                else completed_at
            end
      where game_id = p_game_id;

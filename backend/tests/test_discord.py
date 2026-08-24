@@ -280,7 +280,7 @@ class DiscordTests(unittest.TestCase):
                 "name": "game",
                 "options": [
                     {
-                        "name": "roster",
+                        "name": "challenge",
                         "type": 1,
                         "options": [],
                     }
@@ -371,13 +371,22 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["type"], 4)
         data = response.json()["data"]
-        self.assertIn("Player and points are hidden", data["content"])
-        self.assertNotIn("season PPR points", data["content"])
+        self.assertIn("17-0 Challenge", data["content"])
+        self.assertIn(
+            "Player and points hidden",
+            data["embeds"][0]["description"],
+        )
+        self.assertNotIn("season PPR", data["embeds"][0]["description"])
         self.assertTrue(data["embeds"][0]["thumbnail"]["url"])
         buttons = data["components"][0]["components"]
         self.assertEqual(
             [button["label"] for button in buttons],
-            ["Reroll Team", "Reroll Position", "Lock & Spin Next"],
+            [
+                "Reroll Team",
+                "Reroll Position",
+                "Lock & Spin Next",
+                "Forfeit Run",
+            ],
         )
 
     def test_game_reveal_mode_and_component_advance(self) -> None:
@@ -403,9 +412,29 @@ class DiscordTests(unittest.TestCase):
 
         advanced = self.signed_post(component_payload)
 
-        self.assertIn("season PPR points", started["data"]["content"])
+        self.assertIn(
+            "season PPR",
+            started["data"]["embeds"][0]["description"],
+        )
         self.assertEqual(advanced.json()["type"], 7)
-        self.assertIn("locked", advanced.json()["data"]["content"].lower())
+        self.assertIn("17-0 Challenge", advanced.json()["data"]["content"])
+
+    def test_game_forfeit_ends_run_and_removes_buttons(self) -> None:
+        started = self.signed_post(self.game_payload()).json()
+        forfeit_button = started["data"]["components"][0]["components"][3]
+        payload = self.game_payload(interaction_id="forfeit-component")
+        payload["type"] = 3
+        payload["data"] = {
+            "component_type": 2,
+            "custom_id": forfeit_button["custom_id"],
+        }
+
+        response = self.signed_post(payload)
+
+        self.assertEqual(response.json()["type"], 7)
+        data = response.json()["data"]
+        self.assertIn("Run Forfeited", data["embeds"][0]["title"])
+        self.assertEqual(data["components"], [])
 
     def test_game_buttons_reject_a_different_user_ephemerally(self) -> None:
         started = self.signed_post(self.game_payload()).json()
@@ -708,8 +737,8 @@ class DiscordCommandRegistrationTests(unittest.TestCase):
         self.assertTrue(leader_options["minimum_field"]["autocomplete"])
         self.assertNotIn("choices", leader_options["formula"])
 
-    def test_game_command_is_one_roster_subcommand_with_optional_reveal(self) -> None:
-        self.assertEqual(GAME_COMMAND["options"][0]["name"], "roster")
+    def test_game_command_is_one_challenge_subcommand_with_optional_reveal(self) -> None:
+        self.assertEqual(GAME_COMMAND["options"][0]["name"], "challenge")
         options = {
             option["name"]: option
             for option in GAME_COMMAND["options"][0]["options"]

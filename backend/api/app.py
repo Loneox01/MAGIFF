@@ -358,7 +358,7 @@ def create_app(
             if guild_profile != "test" or discord_game_service is None:
                 return JSONResponse(
                     discord_message(
-                        "Roster roulette is only enabled in MAGIFF's test server."
+                        "The 17-0 Challenge is only enabled in MAGIFF's test server."
                     )
                 )
             try:
@@ -375,19 +375,20 @@ def create_app(
                 return JSONResponse(discord_message(str(error)))
             except Exception:
                 LOGGER.exception(
-                    "Discord roster game action failed request_id=%s interaction_id=%s",
+                    "Discord 17-0 Challenge action failed request_id=%s interaction_id=%s",
                     request.state.request_id,
                     interaction_id,
                 )
                 return JSONResponse(
                     discord_message(
-                        "Roster roulette couldn't update. Retry the button in a "
+                        "The 17-0 Challenge couldn't update. Retry the button in a "
                         f"moment. Request ID: `{request.state.request_id}`"
                     )
                 )
             if game_result.outcome in {
                 GameOutcome.UPDATED,
                 GameOutcome.COMPLETED,
+                GameOutcome.FORFEITED,
                 GameOutcome.STALE,
             } and game_result.state is not None:
                 return JSONResponse(
@@ -485,13 +486,13 @@ def create_app(
                 return JSONResponse(discord_message(str(error)))
             except Exception:
                 LOGGER.exception(
-                    "Discord roster game start failed request_id=%s interaction_id=%s",
+                    "Discord 17-0 Challenge start failed request_id=%s interaction_id=%s",
                     request.state.request_id,
                     interaction_id,
                 )
                 return JSONResponse(
                     discord_message(
-                        "Roster roulette couldn't start. Retry in a moment. "
+                        "The 17-0 Challenge couldn't start. Retry in a moment. "
                         f"Request ID: `{request.state.request_id}`"
                     )
                 )

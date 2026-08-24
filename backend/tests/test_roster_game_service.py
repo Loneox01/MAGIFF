@@ -5,7 +5,10 @@ from dataclasses import replace
 from services.roster_game import (
     GameAction,
     GameOutcome,
+    GamePick,
+    GameStatus,
     PlayerPoolEntry,
+    RosterSlot,
     RosterGameService,
     RosterGameState,
     wins_for_score,
@@ -89,6 +92,15 @@ class RosterGameServiceTests(unittest.TestCase):
         state = self.start()
 
         for index in range(7):
+            if state.pending.roster_slot == RosterSlot.FLEX:
+                position = state.pending.player.position
+                occupied_slots = {pick.roster_slot for pick in state.picks}
+                required_slots = {
+                    "RB": {RosterSlot.RB1, RosterSlot.RB2},
+                    "WR": {RosterSlot.WR1, RosterSlot.WR2},
+                    "TE": {RosterSlot.TE},
+                }[position]
+                self.assertTrue(required_slots.issubset(occupied_slots))
             result = self.service.act(
                 game_id=state.game_id,
                 expected_version=state.version,
@@ -105,6 +117,49 @@ class RosterGameServiceTests(unittest.TestCase):
         self.assertEqual(len({pick.player.team for pick in state.picks}), 7)
         self.assertEqual(len({pick.player.player_id for pick in state.picks}), 7)
         self.assertEqual(state.wins + state.losses, 17)
+
+    def test_forfeit_abandons_run_and_clears_pending_roll(self) -> None:
+        state = self.start()
+        locked = self.service.act(
+            game_id=state.game_id,
+            expected_version=state.version,
+            discord_user_id="123",
+            interaction_id="lock-before-forfeit",
+            action=GameAction.LOCK,
+        ).state
+
+        result = self.service.act(
+            game_id=locked.game_id,
+            expected_version=locked.version,
+            discord_user_id="123",
+            interaction_id="forfeit",
+            action=GameAction.FORFEIT,
+        )
+
+        self.assertEqual(result.outcome, GameOutcome.FORFEITED)
+        self.assertEqual(result.state.status, GameStatus.ABANDONED)
+        self.assertIsNone(result.state.pending)
+        self.assertEqual(
+            result.state.total_points,
+            locked.picks[0].player.fantasy_points_ppr,
+        )
+
+    def test_flex_waits_until_the_matching_base_slots_are_full(self) -> None:
+        rb_entries = [
+            entry for entry in self.repository.pool if entry.position == "RB"
+        ]
+        rb1 = GamePick(1, RosterSlot.RB1, rb_entries[0])
+        rb2 = GamePick(2, RosterSlot.RB2, rb_entries[1])
+
+        empty = self.service._available_slot_positions(())
+        one_rb = self.service._available_slot_positions((rb1,))
+        two_rbs = self.service._available_slot_positions((rb1, rb2))
+
+        self.assertNotIn((RosterSlot.FLEX, "RB"), empty)
+        self.assertNotIn((RosterSlot.FLEX, "RB"), one_rb)
+        self.assertIn((RosterSlot.FLEX, "RB"), two_rbs)
+        self.assertNotIn((RosterSlot.FLEX, "WR"), two_rbs)
+        self.assertNotIn((RosterSlot.FLEX, "TE"), two_rbs)
 
     def test_each_reroll_is_single_use_and_changes_visible_dimension(self) -> None:
         state = self.start()
