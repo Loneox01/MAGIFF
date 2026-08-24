@@ -118,26 +118,35 @@ def _slot_value(state: RosterGameState, slot) -> str:
 
 
 def _roster_lines(state: RosterGameState) -> list[str]:
-    if state.status == GameStatus.ACTIVE and not state.reveal_during_roll:
-        pairs = (
-            (ROSTER_SLOTS[0], ROSTER_SLOTS[5]),
-            (ROSTER_SLOTS[1], ROSTER_SLOTS[3]),
-            (ROSTER_SLOTS[2], ROSTER_SLOTS[4]),
-            (ROSTER_SLOTS[6], None),
-        )
-        lines = []
-        for left, right in pairs:
-            left_cell = f"`{left.value:<5} {_slot_value(state, left):<8}`"
-            right_cell = (
-                ""
-                if right is None
-                else f"  `{right.value:<5} {_slot_value(state, right):<8}`"
-            )
-            lines.append(left_cell + right_cell)
-        return lines
     return [
         f"**{slot.value}** - {_slot_value(state, slot)}"
         for slot in ROSTER_SLOTS
+    ]
+
+
+def _roster_fields(state: RosterGameState) -> list[dict[str, object]]:
+    if state.status == GameStatus.ACTIVE and not state.reveal_during_roll:
+        columns = (
+            (ROSTER_SLOTS[0], ROSTER_SLOTS[1], ROSTER_SLOTS[2], ROSTER_SLOTS[6]),
+            (ROSTER_SLOTS[5], ROSTER_SLOTS[3], ROSTER_SLOTS[4]),
+        )
+        return [
+            {
+                "name": "Roster" if index == 0 else "\u200b",
+                "value": "\n".join(
+                    f"**{slot.value}** - {_slot_value(state, slot)}"
+                    for slot in slots
+                ),
+                "inline": True,
+            }
+            for index, slots in enumerate(columns)
+        ]
+    return [
+        {
+            "name": "Roster",
+            "value": "\n".join(_roster_lines(state)),
+            "inline": False,
+        }
     ]
 
 
@@ -161,7 +170,7 @@ def _embed(state: RosterGameState) -> list[dict[str, object]]:
                 f"{player.fantasy_points_ppr:.1f} season PPR"
             )
         else:
-            lines.append("*Player and points hidden until the final roster.*")
+            lines.append("Player and points hidden until the final roster.")
     elif state.status == GameStatus.COMPLETED:
         player = None
         title = (
@@ -173,20 +182,24 @@ def _embed(state: RosterGameState) -> list[dict[str, object]]:
         title = f"Run Forfeited - {len(state.picks)}/{len(ROSTER_SLOTS)} picks"
         lines.append(f"Saved subtotal: **{state.total_points:,.1f} PPR**")
 
-    lines.extend(["**Roster**", *_roster_lines(state)])
     embed: dict[str, object] = {
         "title": title,
         "description": "\n".join(lines),
+        "fields": _roster_fields(state),
     }
     if state.status == GameStatus.ACTIVE:
-        embed["footer"] = {
-            "text": (
-                "Team reroll: "
-                f"{'used' if state.team_reroll_used else 'available'} | "
-                "Position reroll: "
-                f"{'used' if state.position_reroll_used else 'available'}"
-            )
-        }
+        embed["fields"].append(
+            {
+                "name": "Rerolls",
+                "value": (
+                    "Team: "
+                    f"**{'used' if state.team_reroll_used else 'available'}** | "
+                    "Position: "
+                    f"**{'used' if state.position_reroll_used else 'available'}**"
+                ),
+                "inline": False,
+            }
+        )
     if player is not None and player.team_logo_url:
         embed["thumbnail"] = {"url": player.team_logo_url}
     if player is not None and player.team_color:
@@ -261,7 +274,7 @@ def format_game_state(
     embed = _embed(state)[0]
     if note:
         description = str(embed.get("description") or "")
-        embed["description"] = f"*{note}*\n{description}"
+        embed["description"] = f"**{note}**\n{description}"
     return {
         "content": f"## 17-0 Challenge - {state.season}",
         "embeds": [embed],

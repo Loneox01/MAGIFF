@@ -377,7 +377,15 @@ class DiscordTests(unittest.TestCase):
             data["embeds"][0]["description"],
         )
         self.assertNotIn("season PPR", data["embeds"][0]["description"])
-        self.assertTrue(data["embeds"][0]["thumbnail"]["url"])
+        embed = data["embeds"][0]
+        self.assertTrue(embed["thumbnail"]["url"])
+        self.assertEqual(
+            [field["name"] for field in embed["fields"]],
+            ["Roster", "\u200b", "Rerolls"],
+        )
+        self.assertTrue(embed["fields"][0]["inline"])
+        self.assertTrue(embed["fields"][1]["inline"])
+        self.assertNotIn("footer", embed)
         buttons = data["components"][0]["components"]
         self.assertEqual(
             [button["label"] for button in buttons],
