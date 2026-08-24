@@ -16,7 +16,15 @@ from integrations.discord_news import (
     extract_news_query,
     format_news_result,
 )
-from jobs.register_discord_commands import NEWS_COMMAND, register_guild_command
+from integrations.discord_stats import (
+    extract_stats_query,
+    stats_autocomplete_choices,
+)
+from jobs.register_discord_commands import (
+    NEWS_COMMAND,
+    STATS_COMMAND,
+    register_guild_command,
+)
 from services.news import (
     NewsDetail,
     NewsOutcome,
@@ -25,6 +33,7 @@ from services.news import (
     NewsResult,
     PlayerCandidate,
 )
+from services.stats import StatsOutcome, StatsResult
 
 
 APPLICATION_ID = "123456789012345678"
@@ -103,6 +112,30 @@ class FailingNewsService:
         raise RuntimeError("database unavailable")
 
 
+class FakeStatsService:
+    def __init__(self) -> None:
+        self.queries = []
+
+    def execute(self, query):
+        self.queries.append(query)
+        return StatsResult(
+            outcome=StatsOutcome.SUCCESS,
+            query=query,
+            season=2025,
+            rows=(
+                {
+                    "rank": 1,
+                    "display_name": "A.J. Brown",
+                    "position": "WR",
+                    "team": "PHI",
+                    "metric_value": 10.0,
+                    "inputs": {"receiving_yards": 1500, "targets": 150},
+                },
+            ),
+            formula="receiving_yards / targets",
+        )
+
+
 class DiscordTests(unittest.TestCase):
     def setUp(self) -> None:
         self.private_key = Ed25519PrivateKey.generate()
@@ -123,12 +156,14 @@ class DiscordTests(unittest.TestCase):
         )
         self.agent = FakeAgentService()
         self.news = FakeNewsService()
+        self.stats = FakeStatsService()
         self.webhook = FakeDiscordWebhookClient()
         self.client = TestClient(
             create_app(
                 settings=settings,
                 agent_service=self.agent,
                 news_service=self.news,
+                stats_service=self.stats,
                 discord_webhook_client=self.webhook,
                 discord_interaction_ids=RecentInteractionIds(),
             )
@@ -182,6 +217,32 @@ class DiscordTests(unittest.TestCase):
                     {"name": "player", "type": 3, "value": "Kenny Gainwell"},
                     {"name": "count", "type": 4, "value": 3},
                     {"name": "detail", "type": 3, "value": "summary"},
+                ],
+            },
+        }
+
+    def stats_payload(self, *, interaction_id: str = "stats-interaction") -> dict:
+        return {
+            "id": interaction_id,
+            "application_id": APPLICATION_ID,
+            "guild_id": GUILD_ID,
+            "token": "stats-interaction-token",
+            "type": 2,
+            "data": {
+                "name": "stats",
+                "options": [
+                    {
+                        "name": "leaders",
+                        "type": 1,
+                        "options": [
+                            {
+                                "name": "formula",
+                                "type": 3,
+                                "value": "receiving_yards / targets",
+                            },
+                            {"name": "position", "type": 3, "value": "WR"},
+                        ],
+                    }
                 ],
             },
         }
@@ -338,6 +399,74 @@ class DiscordTests(unittest.TestCase):
         self.assertIn("Retry in a moment", self.webhook.edits[0]["content"])
         self.assertIn("request-123", self.webhook.edits[0]["content"])
 
+    def test_stats_runs_deterministically_and_edits_response(self) -> None:
+        response = self.signed_post(self.stats_payload())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["type"], 4)
+        self.assertIn("player leaders", response.json()["data"]["content"])
+        self.assertEqual(len(self.stats.queries), 1)
+        self.assertEqual(self.stats.queries[0].position, "WR")
+        self.assertIn("A.J. Brown", self.webhook.edits[0]["content"])
+        self.assertIn("10", self.webhook.edits[0]["content"])
+
+    def test_stats_formula_autocomplete_composes_current_expression(self) -> None:
+        payload = self.stats_payload(interaction_id="stats-autocomplete")
+        payload["type"] = 4
+        payload["data"]["options"][0]["options"] = [
+            {
+                "name": "formula",
+                "type": 3,
+                "value": "(receptions + receiv",
+                "focused": True,
+            }
+        ]
+
+        response = self.signed_post(payload)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["type"], 8)
+        values = [choice["value"] for choice in response.json()["data"]["choices"]]
+        self.assertIn("(receptions + receiving_yards", values)
+        self.assertEqual(self.stats.queries, [])
+
+    def test_stats_parser_understands_team_subcommand(self) -> None:
+        payload = self.stats_payload()
+        payload["data"]["options"] = [
+            {
+                "name": "team",
+                "type": 1,
+                "options": [
+                    {"name": "team", "type": 3, "value": "Eagles"},
+                    {"name": "perspective", "type": 3, "value": "defense"},
+                    {"name": "formula", "type": 3, "value": "points_allowed / games"},
+                ],
+            }
+        ]
+
+        query = extract_stats_query(payload)
+
+        self.assertEqual(query.team, "Eagles")
+        self.assertEqual(query.perspective, "defense")
+
+    def test_stats_autocomplete_uses_defensive_catalog(self) -> None:
+        payload = self.stats_payload()
+        payload["type"] = 4
+        payload["data"]["options"] = [
+            {
+                "name": "team-leaders",
+                "type": 1,
+                "options": [
+                    {"name": "perspective", "type": 3, "value": "defense"},
+                    {"name": "formula", "type": 3, "value": "passing_yards", "focused": True},
+                ],
+            }
+        ]
+
+        choices = stats_autocomplete_choices(payload)
+
+        self.assertTrue(any(choice["value"] == "passing_yards_allowed" for choice in choices))
+
     def test_long_answers_are_split_with_a_bounded_message_count(self) -> None:
         messages = split_discord_message("word " * 5_000)
 
@@ -411,6 +540,20 @@ class DiscordCommandRegistrationTests(unittest.TestCase):
         self.assertEqual(
             option_names, {"player", "team", "count", "detail", "previews"}
         )
+
+    def test_stats_command_uses_subcommands_and_native_autocomplete(self) -> None:
+        subcommands = {option["name"]: option for option in STATS_COMMAND["options"]}
+
+        self.assertEqual(
+            set(subcommands),
+            {"player", "leaders", "team", "team-leaders", "fields"},
+        )
+        leader_options = {
+            option["name"]: option for option in subcommands["leaders"]["options"]
+        }
+        self.assertTrue(leader_options["formula"]["autocomplete"])
+        self.assertTrue(leader_options["minimum_field"]["autocomplete"])
+        self.assertNotIn("choices", leader_options["formula"])
 
 
 if __name__ == "__main__":

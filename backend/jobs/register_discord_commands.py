@@ -78,7 +78,120 @@ NEWS_COMMAND = {
     ],
 }
 
-DISCORD_COMMANDS = (ASK_COMMAND, NEWS_COMMAND)
+SEASON_TYPE_OPTION = {
+    "name": "season_type",
+    "description": "Regular season (default) or postseason",
+    "type": 3,
+    "required": False,
+    "choices": [
+        {"name": "Regular season", "value": "REG"},
+        {"name": "Postseason", "value": "POST"},
+    ],
+}
+PERSPECTIVE_OPTION = {
+    "name": "perspective",
+    "description": "Team offense (default) or defense allowed",
+    "type": 3,
+    "required": False,
+    "choices": [
+        {"name": "Offense", "value": "offense"},
+        {"name": "Defense allowed", "value": "defense"},
+    ],
+}
+DIRECTION_OPTION = {
+    "name": "direction",
+    "description": "Highest values first (default) or lowest first",
+    "type": 3,
+    "required": False,
+    "choices": [
+        {"name": "Highest", "value": "desc"},
+        {"name": "Lowest", "value": "asc"},
+    ],
+}
+COUNT_OPTION = {
+    "name": "count",
+    "description": "Number of rows to return (default 5)",
+    "type": 4,
+    "required": False,
+    "min_value": 1,
+    "max_value": 10,
+}
+
+STATS_COMMAND = {
+    "name": "stats",
+    "type": 1,
+    "description": "Look up or rank NFL stats with safe custom formulas",
+    "options": [
+        {
+            "name": "player",
+            "description": "Show one player's season or weekly statistics",
+            "type": 1,
+            "options": [
+                {"name": "player", "description": "Full or partial player name", "type": 3, "required": True, "min_length": 1, "max_length": 100},
+                {"name": "season", "description": "NFL season; defaults to latest stored season", "type": 4, "required": False, "min_value": 1999, "max_value": 2100},
+                {"name": "week", "description": "Optional week; switches to weekly fields", "type": 4, "required": False, "min_value": 1, "max_value": 22},
+                {"name": "view", "description": "Preset shown when formula is omitted", "type": 3, "required": False, "choices": [{"name": value.title(), "value": value} for value in ("summary", "fantasy", "passing", "rushing", "receiving", "usage")]},
+                {"name": "formula", "description": "Optional formula; use autocomplete for fields", "type": 3, "required": False, "autocomplete": True, "max_length": 100},
+                SEASON_TYPE_OPTION,
+            ],
+        },
+        {
+            "name": "leaders",
+            "description": "Rank players by a custom season formula",
+            "type": 1,
+            "options": [
+                {"name": "formula", "description": "Formula assembled from autocomplete fields", "type": 3, "required": True, "autocomplete": True, "max_length": 100},
+                {"name": "season", "description": "NFL season; defaults to latest stored season", "type": 4, "required": False, "min_value": 1999, "max_value": 2100},
+                {"name": "position", "description": "Optional position filter", "type": 3, "required": False, "choices": [{"name": value, "value": value} for value in ("QB", "RB", "WR", "TE", "K")]},
+                {"name": "minimum_field", "description": "Optional eligibility field", "type": 3, "required": False, "autocomplete": True, "max_length": 100},
+                {"name": "minimum_value", "description": "Required minimum for minimum_field", "type": 10, "required": False, "min_value": 0},
+                DIRECTION_OPTION,
+                COUNT_OPTION,
+                SEASON_TYPE_OPTION,
+            ],
+        },
+        {
+            "name": "team",
+            "description": "Show one team's offense or defense statistics",
+            "type": 1,
+            "options": [
+                {"name": "team", "description": "Team abbreviation or official name", "type": 3, "required": True, "min_length": 2, "max_length": 40},
+                {"name": "season", "description": "NFL season; defaults to latest stored season", "type": 4, "required": False, "min_value": 1999, "max_value": 2100},
+                {"name": "week", "description": "Optional single week", "type": 4, "required": False, "min_value": 1, "max_value": 22},
+                PERSPECTIVE_OPTION,
+                {"name": "view", "description": "Preset shown when formula is omitted", "type": 3, "required": False, "choices": [{"name": value.title(), "value": value} for value in ("summary", "passing", "rushing")]},
+                {"name": "formula", "description": "Optional formula; use autocomplete for fields", "type": 3, "required": False, "autocomplete": True, "max_length": 100},
+                SEASON_TYPE_OPTION,
+            ],
+        },
+        {
+            "name": "team-leaders",
+            "description": "Rank teams by a custom offense or defense formula",
+            "type": 1,
+            "options": [
+                {"name": "formula", "description": "Formula assembled from autocomplete fields", "type": 3, "required": True, "autocomplete": True, "max_length": 100},
+                {"name": "season", "description": "NFL season; defaults to latest stored season", "type": 4, "required": False, "min_value": 1999, "max_value": 2100},
+                PERSPECTIVE_OPTION,
+                {"name": "minimum_games", "description": "Minimum games played", "type": 4, "required": False, "min_value": 1, "max_value": 25},
+                DIRECTION_OPTION,
+                COUNT_OPTION,
+                SEASON_TYPE_OPTION,
+            ],
+        },
+        {
+            "name": "fields",
+            "description": "Browse valid formula fields",
+            "type": 1,
+            "options": [
+                {"name": "scope", "description": "Formula field catalog", "type": 3, "required": True, "choices": [{"name": name, "value": value} for name, value in (("Player season", "player-season"), ("Player weekly", "player-weekly"), ("Team offense", "team-offense"), ("Team defense allowed", "team-defense"))]},
+                {"name": "search", "description": "Optional text contained in the field name", "type": 3, "required": False, "max_length": 50},
+                {"name": "count", "description": "Number of fields to show", "type": 4, "required": False, "min_value": 1, "max_value": 25},
+            ],
+        },
+    ],
+}
+
+DISCORD_COMMANDS = (ASK_COMMAND, NEWS_COMMAND, STATS_COMMAND)
 
 
 def register_guild_command(

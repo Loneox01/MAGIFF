@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from integrations.discord import (
+    APPLICATION_COMMAND_AUTOCOMPLETE_INTERACTION,
+    APPLICATION_COMMAND_AUTOCOMPLETE_RESPONSE,
     APPLICATION_COMMAND_INTERACTION,
     CHANNEL_MESSAGE_RESPONSE,
     EPHEMERAL_MESSAGE_FLAG,
@@ -42,8 +44,16 @@ from integrations.discord_news import (
     extract_news_query,
     format_news_pending,
 )
+from integrations.discord_stats import (
+    DiscordStatsRunner,
+    StatsCompletion,
+    extract_stats_query,
+    format_stats_pending,
+    stats_autocomplete_choices,
+)
 from services.agent import AgentService
 from services.news import NewsService
+from services.stats import StatsService
 
 from .config import ApiSettings
 from .schemas import (
@@ -63,6 +73,7 @@ def create_app(
     settings: ApiSettings | None = None,
     agent_service: AgentService | None = None,
     news_service: NewsService | None = None,
+    stats_service: StatsService | None = None,
     discord_webhook_client: DiscordWebhookClient | None = None,
     discord_interaction_ids: RecentInteractionIds | None = None,
 ) -> FastAPI:
@@ -72,6 +83,7 @@ def create_app(
     discord_verifier = None
     discord_runner = None
     discord_news_runner = None
+    discord_stats_runner = None
     interaction_ids = discord_interaction_ids or RecentInteractionIds()
     if api_settings.discord_configured:
         discord_verifier = DiscordRequestVerifier(
@@ -85,6 +97,11 @@ def create_app(
         discord_news_runner = DiscordNewsRunner(
             application_id=api_settings.discord_application_id or "",
             news_service=news_service or NewsService(),
+            webhook_client=discord_webhook_client,
+        )
+        discord_stats_runner = DiscordStatsRunner(
+            application_id=api_settings.discord_application_id or "",
+            stats_service=stats_service or StatsService(),
             webhook_client=discord_webhook_client,
         )
 
@@ -265,13 +282,31 @@ def create_app(
         interaction_type = payload.get("type")
         if interaction_type == PING_INTERACTION:
             return JSONResponse({"type": PONG_RESPONSE})
-        if interaction_type != APPLICATION_COMMAND_INTERACTION:
+        if interaction_type not in {
+            APPLICATION_COMMAND_INTERACTION,
+            APPLICATION_COMMAND_AUTOCOMPLETE_INTERACTION,
+        }:
             return JSONResponse(
                 discord_message("That Discord interaction is not supported.")
             )
         if str(payload.get("guild_id", "")) != api_settings.discord_guild_id:
             return JSONResponse(
                 discord_message("MAGIFF is private to its configured server.")
+            )
+
+        data = payload.get("data")
+        command_name = data.get("name") if isinstance(data, dict) else None
+        if interaction_type == APPLICATION_COMMAND_AUTOCOMPLETE_INTERACTION:
+            choices = (
+                stats_autocomplete_choices(payload)
+                if command_name == "stats"
+                else []
+            )
+            return JSONResponse(
+                {
+                    "type": APPLICATION_COMMAND_AUTOCOMPLETE_RESPONSE,
+                    "data": {"choices": choices},
+                }
             )
 
         interaction_id = str(payload.get("id", "")).strip()
@@ -282,8 +317,6 @@ def create_app(
                 detail="Discord interaction ID and token are required",
             )
 
-        data = payload.get("data")
-        command_name = data.get("name") if isinstance(data, dict) else None
         claimed = interaction_ids.claim(interaction_id)
         suppress_embeds = False
         if command_name == "ask":
@@ -320,9 +353,27 @@ def create_app(
                 )
             content = format_news_pending(news_query)
             suppress_embeds = not news_query.previews
+        elif command_name == "stats" and discord_stats_runner is not None:
+            try:
+                stats_query = extract_stats_query(payload)
+            except ValueError as error:
+                return JSONResponse(discord_message(str(error)))
+            if claimed:
+                background_tasks.add_task(
+                    discord_stats_runner.complete,
+                    StatsCompletion(
+                        interaction_id=interaction_id,
+                        interaction_token=interaction_token,
+                        query=stats_query,
+                        request_id=request.state.request_id,
+                    ),
+                )
+            content = format_stats_pending(stats_query)
         else:
             return JSONResponse(
-                discord_message("Supported commands are `/ask` and `/news`.")
+                discord_message(
+                    "Supported commands are `/ask`, `/news`, and `/stats`."
+                )
             )
 
         if not claimed:

@@ -6,8 +6,8 @@ The backend has four independent entry points:
 - `uvicorn api.app:app --reload` runs the HTTP agent API.
 - `python -m jobs.refresh_reports ...` runs report ingestion. Production
   ingestion remains in GitHub Actions and is not started by the API server.
-- `python -m jobs.register_discord_commands` registers the private `/ask` and
-  `/news` commands in one Discord server.
+- `python -m jobs.register_discord_commands` registers the private `/ask`,
+  `/news`, and `/stats` commands in one Discord server.
 
 ## Local API
 
@@ -88,8 +88,10 @@ Discord calls `POST /v1/discord/interactions` directly. That route does not use
 `MAGIFF_API_KEY`; it verifies Discord's Ed25519 request signature, restricts
 commands to `DISCORD_GUILD_ID`, immediately shows the quoted question and a
 thinking indicator, and edits that message after MAGIFF finishes. `/ask` runs
-the agent; `/news` performs a deterministic newest-first read from the stored
-report database without invoking an LLM. See the complete parameter and retry
+the agent; `/news` performs a deterministic newest-first report read, while
+`/stats` performs deterministic structured lookup and safe formula analytics
+with native field autocomplete. Neither direct command invokes an LLM. See the
+complete parameter and retry
 reference in [`integrations/README.md`](integrations/README.md).
 
 Add these runtime variables to Render alongside the existing API variables:
@@ -119,7 +121,7 @@ After Render deploys the Discord code:
    ```
 
 4. Install the application in the configured server if it is not already
-   installed, then run `/ask` or `/news` there.
+   installed, then run `/ask`, `/news`, or `/stats` there.
 
 The command is registered at guild scope, so changes appear quickly and it is
 not published globally. Render's free service can sleep; a cold start may miss

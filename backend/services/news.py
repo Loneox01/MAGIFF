@@ -110,10 +110,13 @@ class NewsResult:
     full_view_capped: bool = False
 
 
-class NewsRepository(Protocol):
+class IdentityRepository(Protocol):
     def find_players(self, name: str) -> list[PlayerCandidate]: ...
 
     def list_teams(self) -> list[TeamCandidate]: ...
+
+
+class NewsRepository(IdentityRepository, Protocol):
 
     def recent_reports(
         self,
@@ -230,6 +233,97 @@ def _deduplicate_players(values: list[PlayerCandidate]) -> list[PlayerCandidate]
     return list({value.player_id: value for value in values}.values())
 
 
+def resolve_team(
+    repository: IdentityRepository,
+    value: str,
+) -> tuple[TeamCandidate | None, tuple[TeamCandidate, ...], bool]:
+    """Resolve a current franchise without guessing among ambiguous aliases."""
+    teams = repository.list_teams()
+    by_code = {team.code: team for team in teams}
+    aliases: dict[str, list[TeamCandidate]] = {}
+
+    for team in teams:
+        city = team.name.removesuffix(team.nickname).strip()
+        for alias in (team.code, team.name, team.nickname, city):
+            aliases.setdefault(_normalized(alias), []).append(team)
+
+    raw_code = value.strip().upper()
+    raw_code = TEAM_CODE_ALIASES.get(raw_code, raw_code)
+    raw_code = CURRENT_FRANCHISE_CODES.get(raw_code, raw_code)
+    if raw_code in by_code:
+        return by_code[raw_code], (), False
+
+    matches_by_code: dict[str, TeamCandidate] = {}
+    for team in aliases.get(_normalized(value), []):
+        canonical_code = CURRENT_FRANCHISE_CODES.get(team.code, team.code)
+        matches_by_code[canonical_code] = by_code.get(canonical_code, team)
+    matches = list(matches_by_code.values())
+    if len(matches) == 1:
+        canonical = CURRENT_FRANCHISE_CODES.get(matches[0].code, matches[0].code)
+        return by_code.get(canonical, matches[0]), (), False
+    if len(matches) > 1:
+        return None, tuple(matches), True
+
+    needle = _normalized(value)
+    suggestion_distances: dict[str, tuple[int, TeamCandidate]] = {}
+    for team in teams:
+        canonical_code = CURRENT_FRANCHISE_CODES.get(team.code, team.code)
+        canonical_team = by_code.get(canonical_code, team)
+        distance = min(
+            _edit_distance(needle, _normalized(team.code)),
+            _edit_distance(needle, _normalized(team.name)),
+            _edit_distance(needle, _normalized(team.nickname)),
+        )
+        current = suggestion_distances.get(canonical_code)
+        if current is None or distance < current[0]:
+            suggestion_distances[canonical_code] = (distance, canonical_team)
+    ranked_suggestions = sorted(
+        suggestion_distances.values(), key=lambda item: item[0]
+    )
+    threshold = max(2, len(needle) // 3)
+    suggestions = [
+        team
+        for distance, team in ranked_suggestions
+        if distance <= threshold
+    ][:3]
+    return None, tuple(suggestions), False
+
+
+def resolve_player(
+    repository: IdentityRepository,
+    value: str,
+    team: TeamCandidate | None = None,
+) -> tuple[
+    PlayerCandidate | None,
+    tuple[PlayerCandidate, ...],
+    str | None,
+]:
+    """Resolve one player, with a conservative surname fallback."""
+    candidates = _deduplicate_players(repository.find_players(value))
+    if not candidates:
+        surname = _surname(value)
+        if surname:
+            candidates = _deduplicate_players(repository.find_players(surname))
+
+    if len(candidates) > 1 and team is not None:
+        team_matches = [
+            candidate for candidate in candidates if candidate.team == team.code
+        ]
+        if len(team_matches) == 1:
+            candidates = team_matches
+
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        note = None
+        if _normalized(candidate.display_name) != _normalized(value):
+            note = (
+                f"Interpreted `{value.strip()}` as "
+                f"**{candidate.display_name}**."
+            )
+        return candidate, (), note
+    return None, tuple(candidates[:5]), None
+
+
 class NewsService:
     def __init__(self, repository: NewsRepository | None = None) -> None:
         self.repository = repository or SupabaseNewsRepository()
@@ -237,55 +331,7 @@ class NewsService:
     def _resolve_team(
         self, value: str
     ) -> tuple[TeamCandidate | None, tuple[TeamCandidate, ...], bool]:
-        teams = self.repository.list_teams()
-        by_code = {team.code: team for team in teams}
-        aliases: dict[str, list[TeamCandidate]] = {}
-
-        for team in teams:
-            city = team.name.removesuffix(team.nickname).strip()
-            for alias in (team.code, team.name, team.nickname, city):
-                aliases.setdefault(_normalized(alias), []).append(team)
-
-        raw_code = value.strip().upper()
-        raw_code = TEAM_CODE_ALIASES.get(raw_code, raw_code)
-        raw_code = CURRENT_FRANCHISE_CODES.get(raw_code, raw_code)
-        if raw_code in by_code:
-            return by_code[raw_code], (), False
-
-        matches_by_code: dict[str, TeamCandidate] = {}
-        for team in aliases.get(_normalized(value), []):
-            canonical_code = CURRENT_FRANCHISE_CODES.get(team.code, team.code)
-            matches_by_code[canonical_code] = by_code.get(canonical_code, team)
-        matches = list(matches_by_code.values())
-        if len(matches) == 1:
-            canonical = CURRENT_FRANCHISE_CODES.get(matches[0].code, matches[0].code)
-            return by_code.get(canonical, matches[0]), (), False
-        if len(matches) > 1:
-            return None, tuple(matches), True
-
-        needle = _normalized(value)
-        suggestion_distances: dict[str, tuple[int, TeamCandidate]] = {}
-        for team in teams:
-            canonical_code = CURRENT_FRANCHISE_CODES.get(team.code, team.code)
-            canonical_team = by_code.get(canonical_code, team)
-            distance = min(
-                _edit_distance(needle, _normalized(team.code)),
-                _edit_distance(needle, _normalized(team.name)),
-                _edit_distance(needle, _normalized(team.nickname)),
-            )
-            current = suggestion_distances.get(canonical_code)
-            if current is None or distance < current[0]:
-                suggestion_distances[canonical_code] = (distance, canonical_team)
-        ranked_suggestions = sorted(
-            suggestion_distances.values(), key=lambda item: item[0]
-        )
-        threshold = max(2, len(needle) // 3)
-        suggestions = [
-            team
-            for distance, team in ranked_suggestions
-            if distance <= threshold
-        ][:3]
-        return None, tuple(suggestions), False
+        return resolve_team(self.repository, value)
 
     def _resolve_player(
         self,
@@ -296,31 +342,7 @@ class NewsService:
         tuple[PlayerCandidate, ...],
         str | None,
     ]:
-        candidates = _deduplicate_players(self.repository.find_players(value))
-        if not candidates:
-            surname = _surname(value)
-            if surname:
-                candidates = _deduplicate_players(
-                    self.repository.find_players(surname)
-                )
-
-        if len(candidates) > 1 and team is not None:
-            team_matches = [
-                candidate for candidate in candidates if candidate.team == team.code
-            ]
-            if len(team_matches) == 1:
-                candidates = team_matches
-
-        if len(candidates) == 1:
-            candidate = candidates[0]
-            note = None
-            if _normalized(candidate.display_name) != _normalized(value):
-                note = (
-                    f"Interpreted `{value.strip()}` as "
-                    f"**{candidate.display_name}**."
-                )
-            return candidate, (), note
-        return None, tuple(candidates[:5]), None
+        return resolve_player(self.repository, value, team)
 
     def latest(self, query: NewsQuery) -> NewsResult:
         resolved_team = None

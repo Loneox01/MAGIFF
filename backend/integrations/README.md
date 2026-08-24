@@ -59,6 +59,32 @@ ambiguous filter returns matching candidates or a suggested retry, and no
 report query is made until the identity is safe. If valid filters have no stored
 news, remove one filter or run unfiltered `/news` to inspect current coverage.
 
+### `/stats`
+
+Reads structured NFL data directly from Supabase without invoking an LLM. Its
+subcommands cover one player, player leaderboards, one team, team leaderboards,
+and field discovery.
+
+The `formula` and `minimum_field` inputs use Discord's native autocomplete,
+backed by the same field catalogs as processing and the agent tools. Select a
+field, type an operator, then select another field—for example:
+
+```text
+/stats player player:A.J. Brown season:2025 view:receiving
+/stats player player:A.J. Brown season:2025 formula:receiving_yards / targets
+/stats player player:A.J. Brown season:2025 week:1 formula:fantasy_points_ppr
+/stats leaders formula:receiving_yards / targets position:WR minimum_field:targets minimum_value:50
+/stats team team:PHI season:2025 perspective:defense view:summary
+/stats team-leaders formula:points_allowed / games perspective:defense
+/stats fields scope:player-season search:receiving
+```
+
+Only catalog fields, numbers, `+`, `-`, `*`, `/`, and parentheses are accepted.
+Autocomplete helps assemble an expression, but the backend always validates the
+submitted formula because Discord permits arbitrary text. Omitting `season`
+selects the latest stored season available for that query. Player and team
+names use the same conservative resolution and ambiguity punts as `/news`.
+
 ## Adding another Discord command
 
 1. Define its typed service behavior and failure outcomes in `services/`.
