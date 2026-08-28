@@ -209,6 +209,11 @@ def main() -> None:
             _print_route(result)
             for call in result.tool_calls:
                 _print_tool(call)
+            if result.web_search_calls:
+                print(
+                    f"\nWeb search: {result.web_search_calls} hosted "
+                    f"{'call' if result.web_search_calls == 1 else 'calls'}"
+                )
         print(f"\nAgent: {result.answer}")
         _print_usage(result)
         print()

@@ -12,10 +12,12 @@ request router (Luna, structured output, daily local cache)
     |
     +--> selected structured NFL tool groups
     |
-    `--> search_reports
+    +--> search_reports
              |
              `--> report planner + Supabase entity grounding
                   + metadata filters + hybrid retrieval + reranking
+    |
+    `--> hosted web search (explicit/live route or weak-report fallback only)
     |
     v
 main answer agent (Terra)
@@ -40,7 +42,10 @@ Routes and token telemetry are stored in the ignored
 reuse the route for the current date. Configure the router model with
 `OPENAI_ROUTER_MODEL`; the default is `gpt-5.6-luna`.
 
-Web search is deliberately absent from the route enum and active tool registry.
-Its commented definition remains in `main.py`. Enabling it later requires a web
-route plus a local-evidence-first fallback policy; it should not mask ambiguous
-identity, invalid planning, or ordinary tool errors.
+Hosted web search is a controlled fallback. The router exposes it immediately
+only for an explicit public-web request or a genuinely live information need.
+Ordinary current questions use maintained reports first; a failed, weak, or
+no-evidence report result deterministically enables one required web-search
+round. Partial report evidence does not trigger the fallback. Web calls and
+cited sources are returned in API telemetry, while hosted-tool fees remain
+separate from the text-token cost estimate.

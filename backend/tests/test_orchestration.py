@@ -148,6 +148,16 @@ class OrchestrationTests(unittest.TestCase):
         self.assertNotIn("search_reports", names)
         self.assertEqual(names.count("find_players"), 1)
 
+        web_only = RequestRoute(
+            request_summary="Search the live public web.",
+            intent=RequestIntent.NEWS,
+            freshness=FreshnessRequirement.LIVE,
+            capabilities=[Capability.WEB_SEARCH],
+            structured_domains=[],
+            rationale="The user explicitly requested live public evidence.",
+        )
+        self.assertEqual(tool_names_for_route(web_only), [])
+
     def test_report_pipeline_returns_partial_evidence_and_suppresses_weak(self) -> None:
         plan = _report_plan()
         plan_result = QueryPlanResult(

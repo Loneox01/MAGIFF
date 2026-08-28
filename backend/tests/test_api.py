@@ -100,6 +100,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body["answer"], "Test answer.")
         self.assertEqual(body["usage"]["input_tokens"], 120)
         self.assertEqual(body["tool_calls"][0]["name"], "get_player_season_stats")
+        self.assertEqual(body["web_search_calls"], 0)
+        self.assertEqual(body["web_sources"], [])
         self.assertEqual(body["request_id"], response.headers["x-request-id"])
 
     def test_blank_prompt_is_rejected_before_agent_execution(self) -> None:

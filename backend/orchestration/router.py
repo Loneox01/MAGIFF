@@ -19,7 +19,8 @@ from prompts import REQUEST_ROUTER_INSTRUCTIONS
 from .config import DEFAULT_ROUTER_INDEX_PATH, DEFAULT_ROUTER_MODEL
 
 
-ROUTER_PROMPT_VERSION = "1"
+ROUTER_PROMPT_VERSION = "2"
+
 
 class RouterModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -28,6 +29,7 @@ class RouterModel(BaseModel):
 class Capability(StrEnum):
     STRUCTURED_DATA = "structured_data"
     REPORTS = "reports"
+    WEB_SEARCH = "web_search"
 
 
 class StructuredDomain(StrEnum):

@@ -51,6 +51,11 @@ Rules:
 - Use search_reports for injuries, practice news, transactions, role changes,
   timelines, and other narrative evidence. Its results have already passed
   query planning, metadata grounding, hybrid retrieval, and reranking.
+- Treat maintained structured data and reports as the primary evidence source.
+  Use web search only when the route explicitly supplies it for a live or
+  user-requested web need, or when the runtime enables it after maintained
+  report retrieval returns weak/no evidence or fails. Do not repeat supported
+  local research on the web merely to gather more sources.
 - When the whole user question is a report request, pass its wording to
   search_reports unchanged where practical. For a mixed request, extract only
   the narrative subquestion while preserving its literal entities and time
@@ -60,8 +65,9 @@ Rules:
 - A report result with status no_evidence is not evidence. Do not answer the
   narrative portion from memory. A partial result may support a qualified answer
   only when its stated limitation is made clear.
-- Cite report claims with the returned source URL and publication date. Never
-  claim to have searched the web; web search is disabled in this build.
+- Cite report claims with the returned source URL and publication date. Cite
+  web-grounded claims with the web tool's returned citations. Prefer primary
+  team/league sources and reputable reporting when web evidence is needed.
 - When both structured_data and reports are selected, use each for the portion
   it is authoritative for and synthesize the evidence without blurring sources.
   Do not stop after one branch returns empty when the other selected branch can
@@ -102,12 +108,16 @@ Available capabilities:
   schedules/results, rosters, depth charts, snap counts, and ECR
 - reports: injuries, practice updates, transactions, role or workload news,
   camp observations, timelines, conflicting reports, and other narrative evidence
+- web_search: live public-web evidence outside the maintained report corpus
 
 Choose both when the answer genuinely requires structured facts and narrative
 evidence. A player or team name alone does not require structured_data, and a
 request for a number or ranking should not be sent to reports merely because a
 report might mention it. If uncertain between the two, include both rather than
 silently excluding a potentially necessary evidence source.
+Web search supplements rather than replaces a needed maintained capability; if
+a live/public-web request also needs structured facts or maintained reports,
+include those capabilities too.
 
 When structured_data is selected, choose every relevant structured domain and
 no unrelated domains:
@@ -121,7 +131,10 @@ no unrelated domains:
 
 Classify freshness from the request itself. `live` means the user explicitly
 needs information newer than locally maintained data, not merely that the topic
-could change. Web search is not an available capability in this build.
+could change. Choose web_search when the user explicitly asks to search/browse
+the public web or when genuinely live information is required. Do not choose it
+for an ordinary current-status request that maintained reports can answer; the
+runtime can add web search later if maintained report retrieval is insufficient.
 """
 
 
@@ -388,10 +401,21 @@ evidence for answering the question. Keep every reason short and evidence-based.
 """
 
 
-def build_system_prompt(route: RequestRoute) -> str:
+def build_system_prompt(
+    route: RequestRoute,
+    *,
+    web_fallback_enabled: bool = False,
+) -> str:
     """Add request-specific routing context to the main agent instructions."""
     capabilities = ", ".join(item.value for item in route.capabilities)
     domains = ", ".join(item.value for item in route.structured_domains) or "none"
+    fallback_context = (
+        "- Web fallback state: enabled because maintained report evidence was "
+        "weak, absent, or unavailable. Search before making any still-unsupported "
+        "current claim; retain supported local facts.\n"
+        if web_fallback_enabled
+        else "- Web fallback state: not activated.\n"
+    )
     return (
         f"{MAIN_AGENT_INSTRUCTIONS}\n"
         "Request routing context (for capability selection, not factual evidence):\n"
@@ -401,6 +425,7 @@ def build_system_prompt(route: RequestRoute) -> str:
         f"- Freshness: {route.freshness.value}\n"
         f"- Available capabilities: {capabilities}\n"
         f"- Available structured domains: {domains}\n"
+        f"{fallback_context}"
         "Use only the tools supplied for this route. If they cannot support a "
         "claim, state the limitation.\n"
     )

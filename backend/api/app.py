@@ -229,6 +229,7 @@ def create_app(
                     "output_tokens": result.usage.output_tokens,
                     "estimated_cost_usd": result.estimated_cost_usd,
                     "tool_calls": len(result.tool_calls),
+                    "web_search_calls": result.web_search_calls,
                     "router_fallback": result.route.fallback_used,
                 },
                 separators=(",", ":"),

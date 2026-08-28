@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -65,20 +66,12 @@ def _configured_parallel_tool_limit() -> int:
 
 DEFAULT_MAX_PARALLEL_TOOLS = _configured_parallel_tool_limit()
 
-# Future web fallback, deliberately unavailable to the agent for now. Before
-# enabling it, add a web capability to the request router and update the system
-# prompt with an explicit maintained-evidence-first fallback policy.
-# WEB_SEARCH_TOOL = {
-#     "type": "web_search",
-#     "filters": {
-#         "allowed_domains": [
-#             "nfl.com",
-#             "espn.com",
-#             "cbssports.com",
-#             "profootballtalk.nbcsports.com",
-#         ]
-#     },
-# }
+WEB_SEARCH_TOOL = {
+    "type": "web_search",
+    "search_context_size": "low",
+}
+MAX_WEB_SEARCH_CALLS = 2
+_RAW_CITATION_PATTERN = re.compile(r"\s*\ue200cite\ue202[^\ue201]+\ue201")
 
 
 @dataclass(frozen=True)
@@ -113,6 +106,12 @@ class ToolCallTelemetry:
 
 
 @dataclass(frozen=True)
+class WebSource:
+    title: str
+    url: str
+
+
+@dataclass(frozen=True)
 class AgentRunResult:
     answer: str
     model: str
@@ -122,6 +121,8 @@ class AgentRunResult:
     route: RouteTelemetry
     tool_calls: tuple[ToolCallTelemetry, ...]
     estimated_cost_usd: float | None = None
+    web_search_calls: int = 0
+    web_sources: tuple[WebSource, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,109 @@ def _report_pipeline_summary(details: Mapping[str, Any]) -> dict[str, Any] | Non
             "latency_ms": int(reranker.get("latency_ms", 0) or 0),
         },
     }
+
+
+def _item_value(item: Any, name: str, default: Any = None) -> Any:
+    if isinstance(item, Mapping):
+        return item.get(name, default)
+    return getattr(item, name, default)
+
+
+def _citation_data(annotation: Any) -> Any | None:
+    if _item_value(annotation, "type") != "url_citation":
+        return None
+    return _item_value(annotation, "url_citation") or annotation
+
+
+def _citation_source(annotation: Any) -> WebSource | None:
+    citation = _citation_data(annotation)
+    if citation is None:
+        return None
+    url = str(_item_value(citation, "url", "") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return None
+    title = str(_item_value(citation, "title", "") or "").strip()
+    return WebSource(title=title or url, url=url)
+
+
+def _message_text_blocks(response: Any) -> list[Any]:
+    blocks: list[Any] = []
+    for item in list(_item_value(response, "output", []) or []):
+        if _item_value(item, "type") != "message":
+            continue
+        for block in list(_item_value(item, "content", []) or []):
+            if _item_value(block, "type") == "output_text":
+                blocks.append(block)
+    return blocks
+
+
+def _response_sources(response: Any) -> tuple[WebSource, ...]:
+    sources: dict[str, WebSource] = {}
+    for block in _message_text_blocks(response):
+        for annotation in list(_item_value(block, "annotations", []) or []):
+            source = _citation_source(annotation)
+            if source is not None:
+                sources.setdefault(source.url, source)
+    return tuple(sources.values())
+
+
+def _render_response_answer(response: Any) -> str:
+    rendered_blocks: list[str] = []
+    for block in _message_text_blocks(response):
+        text = str(_item_value(block, "text", "") or "")
+        citations: list[tuple[int, WebSource]] = []
+        for annotation in list(_item_value(block, "annotations", []) or []):
+            citation = _citation_data(annotation)
+            source = _citation_source(annotation)
+            if citation is None or source is None:
+                continue
+            end_index = _item_value(citation, "end_index")
+            if isinstance(end_index, int) and 0 <= end_index <= len(text):
+                citations.append((end_index, source))
+
+        for end_index, source in sorted(
+            citations,
+            key=lambda item: item[0],
+            reverse=True,
+        ):
+            label = source.title.replace("[", "\\[").replace("]", "\\]")
+            link = f" [{label}]({source.url})"
+            if source.url not in text:
+                text = f"{text[:end_index]}{link}{text[end_index:]}"
+        rendered_blocks.append(_RAW_CITATION_PATTERN.sub("", text))
+
+    if rendered_blocks:
+        return "\n\n".join(block for block in rendered_blocks if block)
+    return str(_item_value(response, "output_text", "") or "")
+
+
+def _append_missing_sources(
+    answer: str,
+    sources: Mapping[str, WebSource],
+) -> str:
+    missing = [source for url, source in sources.items() if url not in answer]
+    if not missing:
+        return answer
+    links = "\n".join(
+        f"- [{source.title.replace('[', '').replace(']', '')}]({source.url})"
+        for source in missing
+    )
+    separator = "\n\n" if answer else ""
+    return f"{answer}{separator}Sources:\n{links}"
+
+
+def _needs_web_fallback(outcomes: list[_ToolCallOutcome]) -> bool:
+    for outcome in outcomes:
+        if outcome.name != "search_reports":
+            continue
+        if not outcome.succeeded:
+            return True
+        details = outcome.report_pipeline or {}
+        if details.get("status") == "no_evidence":
+            return True
+        if details.get("evidence_sufficiency") == "weak":
+            return True
+    return False
 
 
 class AgentService:
@@ -500,7 +604,11 @@ class AgentService:
 
         started_at = time.perf_counter()
         route, route_telemetry = self._route(normalized_prompt)
-        tools = self.tool_schema_builder(route)
+        local_tools = self.tool_schema_builder(route)
+        web_routed = Capability.WEB_SEARCH in route.capabilities
+        web_enabled = web_routed
+        force_web_search = False
+        web_route_retry_used = False
         input_items: list[Any] = [
             {"role": "user", "content": normalized_prompt}
         ]
@@ -524,17 +632,39 @@ class AgentService:
             else:
                 estimated_cost_usd += route_cost or 0.0
         tool_telemetry: list[ToolCallTelemetry] = []
+        web_search_calls = 0
+        web_sources: dict[str, WebSource] = {}
         player_reference_cache: dict[
             str, ResolvedPlayerReference | PlayerReferenceError
         ] = {}
 
         for round_index in range(1, self.max_tool_rounds + 1):
+            active_tools = (
+                [WEB_SEARCH_TOOL]
+                if force_web_search
+                else [
+                    *local_tools,
+                    *([WEB_SEARCH_TOOL] if web_enabled else []),
+                ]
+            )
+            request: dict[str, Any] = {
+                "model": self.model,
+                "instructions": build_system_prompt(
+                    route,
+                    web_fallback_enabled=web_enabled and not web_routed,
+                ),
+                "tools": active_tools,
+                "parallel_tool_calls": True,
+                "input": input_items,
+            }
+            if web_enabled:
+                request["max_tool_calls"] = MAX_WEB_SEARCH_CALLS
+            if force_web_search:
+                request["tool_choice"] = "required"
+                force_web_search = False
+
             response = self.client.responses.create(
-                model=self.model,
-                instructions=build_system_prompt(route),
-                tools=tools,
-                parallel_tool_calls=True,
-                input=input_items,
+                **request,
             )
 
             usage = getattr(response, "usage", None)
@@ -557,6 +687,12 @@ class AgentService:
                     estimated_cost_usd += response_cost or 0.0
 
             response_output = list(getattr(response, "output", []) or [])
+            web_search_calls += sum(
+                _item_value(item, "type") == "web_search_call"
+                for item in response_output
+            )
+            for source in _response_sources(response):
+                web_sources.setdefault(source.url, source)
             input_items.extend(response_output)
             tool_calls = [
                 item
@@ -565,8 +701,20 @@ class AgentService:
             ]
 
             if not tool_calls:
+                if (
+                    web_routed
+                    and web_search_calls == 0
+                    and not web_route_retry_used
+                ):
+                    web_route_retry_used = True
+                    force_web_search = True
+                    continue
+                answer = _append_missing_sources(
+                    _render_response_answer(response),
+                    web_sources,
+                )
                 return AgentRunResult(
-                    answer=str(getattr(response, "output_text", "") or ""),
+                    answer=answer,
                     model=self.model,
                     latency_seconds=time.perf_counter() - started_at,
                     tool_rounds=round_index - 1,
@@ -580,6 +728,8 @@ class AgentService:
                     estimated_cost_usd=(
                         estimated_cost_usd if cost_is_complete else None
                     ),
+                    web_search_calls=web_search_calls,
+                    web_sources=tuple(web_sources.values()),
                 )
 
             prepared_calls = self._prepare_tool_calls(
@@ -588,6 +738,9 @@ class AgentService:
                 player_cache=player_reference_cache,
             )
             outcomes = self._execute_tool_batch(prepared_calls)
+            if not web_enabled and _needs_web_fallback(outcomes):
+                web_enabled = True
+                force_web_search = True
             for outcome in outcomes:
                 total_input_tokens += outcome.input_tokens
                 total_cached_input_tokens += outcome.cached_input_tokens

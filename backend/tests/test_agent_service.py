@@ -39,6 +39,24 @@ def _route_result() -> RequestRouteResult:
     )
 
 
+def _reports_route_result() -> RequestRouteResult:
+    return RequestRouteResult(
+        route=RequestRoute(
+            request_summary="Find current role news.",
+            intent=RequestIntent.NEWS,
+            freshness=FreshnessRequirement.CURRENT,
+            capabilities=[Capability.REPORTS],
+            structured_domains=[],
+            rationale="Current narrative evidence is required.",
+        ),
+        model="test-router",
+        cached=False,
+        input_tokens=20,
+        cached_input_tokens=5,
+        output_tokens=4,
+    )
+
+
 def _usage(input_tokens: int, output_tokens: int, cached: int = 0):
     return SimpleNamespace(
         input_tokens=input_tokens,
@@ -48,6 +66,189 @@ def _usage(input_tokens: int, output_tokens: int, cached: int = 0):
 
 
 class AgentServiceTests(unittest.TestCase):
+    def test_routed_web_search_is_available_and_citations_are_clickable(
+        self,
+    ) -> None:
+        text = "Minnesota named its Week 1 starter."
+        citation = SimpleNamespace(
+            type="url_citation",
+            url="https://www.nfl.com/example",
+            title="NFL announcement",
+            start_index=0,
+            end_index=len(text),
+        )
+        response = SimpleNamespace(
+            output=[
+                SimpleNamespace(type="web_search_call"),
+                SimpleNamespace(
+                    type="message",
+                    content=[
+                        SimpleNamespace(
+                            type="output_text",
+                            text=text,
+                            annotations=[citation],
+                        )
+                    ],
+                ),
+            ],
+            output_text=text,
+            usage=_usage(100, 12),
+        )
+        captured = []
+        route_result = replace(
+            _reports_route_result(),
+            route=_reports_route_result().route.model_copy(
+                update={"capabilities": [Capability.WEB_SEARCH]},
+            ),
+        )
+        service = AgentService(
+            client=SimpleNamespace(
+                responses=SimpleNamespace(
+                    create=lambda **kwargs: captured.append(kwargs) or response
+                )
+            ),
+            router_factory=lambda: SimpleNamespace(
+                route=lambda _: route_result
+            ),
+            tool_schema_builder=lambda _: [],
+        )
+
+        result = service.run("Search the web for the latest announcement.")
+
+        self.assertEqual(captured[0]["tools"][0]["type"], "web_search")
+        self.assertEqual(captured[0]["max_tool_calls"], 2)
+        self.assertEqual(result.web_search_calls, 1)
+        self.assertIn(
+            "[NFL announcement](https://www.nfl.com/example)",
+            result.answer,
+        )
+        self.assertEqual(result.web_sources[0].title, "NFL announcement")
+
+    def test_weak_report_evidence_forces_one_web_fallback_round(self) -> None:
+        report_call = SimpleNamespace(
+            type="function_call",
+            name="search_reports",
+            arguments=json.dumps({"query": "Latest role update", "limit": 5}),
+            call_id="reports-call",
+        )
+        text = "A current public report clarified the role."
+        citation = SimpleNamespace(
+            type="url_citation",
+            url="https://www.espn.com/example",
+            title="Current report",
+            start_index=0,
+            end_index=len(text),
+        )
+        responses = iter(
+            [
+                SimpleNamespace(
+                    output=[report_call],
+                    output_text="",
+                    usage=_usage(20, 4),
+                ),
+                SimpleNamespace(
+                    output=[
+                        SimpleNamespace(type="web_search_call"),
+                        SimpleNamespace(
+                            type="message",
+                            content=[
+                                SimpleNamespace(
+                                    type="output_text",
+                                    text=text,
+                                    annotations=[citation],
+                                )
+                            ],
+                        ),
+                    ],
+                    output_text=text,
+                    usage=_usage(30, 6),
+                ),
+            ]
+        )
+        captured = []
+
+        def create(**kwargs):
+            captured.append(kwargs)
+            return next(responses)
+
+        def search_reports(query, limit, source_question=None):
+            return ToolExecutionResult(
+                output={"status": "no_evidence", "reports": []},
+                details={
+                    "component": "report_pipeline",
+                    "status": "no_evidence",
+                    "evidence_sufficiency": "weak",
+                },
+            )
+
+        service = AgentService(
+            client=SimpleNamespace(responses=SimpleNamespace(create=create)),
+            router_factory=lambda: SimpleNamespace(
+                route=lambda _: _reports_route_result()
+            ),
+            tool_handlers={"search_reports": search_reports},
+            tool_schema_builder=lambda _: [
+                {"type": "function", "name": "search_reports"}
+            ],
+        )
+
+        result = service.run("What is the latest role update?")
+
+        self.assertEqual(captured[0]["tools"][0]["type"], "function")
+        self.assertNotIn("max_tool_calls", captured[0])
+        self.assertEqual(captured[1]["tools"], [
+            {"type": "web_search", "search_context_size": "low"}
+        ])
+        self.assertEqual(captured[1]["tool_choice"], "required")
+        self.assertIn("Web fallback state: enabled", captured[1]["instructions"])
+        self.assertEqual(result.web_search_calls, 1)
+        self.assertEqual(result.tool_rounds, 1)
+
+    def test_routed_web_need_retries_once_when_model_skips_search(self) -> None:
+        responses = iter(
+            [
+                SimpleNamespace(
+                    output=[],
+                    output_text="Unsupported first answer.",
+                    usage=_usage(10, 2),
+                ),
+                SimpleNamespace(
+                    output=[SimpleNamespace(type="web_search_call")],
+                    output_text="Web-grounded answer.",
+                    usage=_usage(10, 2),
+                ),
+            ]
+        )
+        captured = []
+        route_result = replace(
+            _reports_route_result(),
+            route=_reports_route_result().route.model_copy(
+                update={"capabilities": [Capability.WEB_SEARCH]},
+            ),
+        )
+
+        def create(**kwargs):
+            captured.append(kwargs)
+            return next(responses)
+
+        service = AgentService(
+            client=SimpleNamespace(responses=SimpleNamespace(create=create)),
+            router_factory=lambda: SimpleNamespace(
+                route=lambda _: route_result
+            ),
+            tool_schema_builder=lambda _: [],
+        )
+
+        result = service.run("Search for a live update.")
+
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[1]["tools"], [
+            {"type": "web_search", "search_context_size": "low"}
+        ])
+        self.assertEqual(captured[1]["tool_choice"], "required")
+        self.assertEqual(result.answer, "Web-grounded answer.")
+        self.assertEqual(result.web_search_calls, 1)
+
     def test_estimates_router_and_agent_models_at_separate_rates(self) -> None:
         response = SimpleNamespace(
             output=[],

@@ -51,6 +51,11 @@ class ToolCallTelemetryResponse(ApiModel):
     report_pipeline: dict[str, Any] | None
 
 
+class WebSourceResponse(ApiModel):
+    title: str
+    url: str
+
+
 class AgentQueryResponse(ApiModel):
     request_id: str
     answer: str
@@ -61,6 +66,8 @@ class AgentQueryResponse(ApiModel):
     route: RouteTelemetryResponse
     tool_calls: list[ToolCallTelemetryResponse]
     estimated_cost_usd: float | None = Field(default=None, ge=0)
+    web_search_calls: int = Field(default=0, ge=0)
+    web_sources: list[WebSourceResponse] = Field(default_factory=list)
 
 
 class HealthResponse(ApiModel):
