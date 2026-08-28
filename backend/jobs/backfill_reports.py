@@ -62,11 +62,19 @@ class BackfillProgress:
     new_reports: int
     changed_reports: int
     completed_fantasypros_ids: frozenset[str]
+    ecr_snapshot_date: date | None
+
+
+@dataclass(frozen=True)
+class BackfillDefinition:
+    ecr_snapshot_date: date
+    candidates: tuple[BackfillCandidate, ...]
 
 
 @dataclass(frozen=True)
 class BackfillResult:
     backfill_id: str
+    ecr_snapshot_date: str
     status: str
     reason: str | None
     cutoff_from: str
@@ -81,7 +89,11 @@ class BackfillResult:
     processed_players: list[dict[str, object]]
 
 
-CandidateLoader = Callable[[Client, int, str, str, int], list[BackfillCandidate]]
+CandidateLoader = Callable[
+    [Client, int, str, str, int, date],
+    list[BackfillCandidate],
+]
+DefinitionLoader = Callable[..., BackfillDefinition]
 
 
 def _batches(values: list[str], size: int = 100) -> list[list[str]]:
@@ -95,22 +107,8 @@ def _latest_ecr_player_ids(
     scoring_format: str,
     league_format: str,
     limit: int,
+    snapshot_date: date,
 ) -> list[str]:
-    snapshot = (
-        client.table("player_ecr")
-        .select("scrape_date")
-        .eq("season", season)
-        .eq("scoring_format", scoring_format)
-        .eq("league_format", league_format)
-        .eq("snapshot_type", "current")
-        .order("scrape_date", desc=True)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    if not snapshot:
-        return []
     rows = (
         client.table("player_ecr")
         .select("player_id,overall_rank")
@@ -118,7 +116,7 @@ def _latest_ecr_player_ids(
         .eq("scoring_format", scoring_format)
         .eq("league_format", league_format)
         .eq("snapshot_type", "current")
-        .eq("scrape_date", snapshot[0]["scrape_date"])
+        .eq("scrape_date", snapshot_date.isoformat())
         .order("overall_rank")
         .limit(limit)
         .execute()
@@ -126,6 +124,28 @@ def _latest_ecr_player_ids(
         or []
     )
     return [str(row["player_id"]) for row in rows if row.get("player_id")]
+
+
+def _select_ecr_snapshot_date(
+    client: Client,
+    *,
+    season: int,
+    scoring_format: str,
+    league_format: str,
+    on_or_before: date | None,
+) -> date | None:
+    query = (
+        client.table("player_ecr")
+        .select("scrape_date")
+        .eq("season", season)
+        .eq("scoring_format", scoring_format)
+        .eq("league_format", league_format)
+        .eq("snapshot_type", "current")
+    )
+    if on_or_before is not None:
+        query = query.lte("scrape_date", on_or_before.isoformat())
+    rows = query.order("scrape_date", desc=True).limit(1).execute().data or []
+    return date.fromisoformat(str(rows[0]["scrape_date"])) if rows else None
 
 
 def _recent_producer_player_ids(
@@ -208,8 +228,9 @@ def load_backfill_candidates(
     scoring_format: str,
     league_format: str,
     limit: int,
+    ecr_snapshot_date: date,
 ) -> list[BackfillCandidate]:
-    """Build a stable, fantasy-relevance-first player feed queue."""
+    """Build a fantasy-relevance-first queue from one pinned ECR snapshot."""
     if limit < 1:
         raise ValueError("candidate limit must be positive")
     source_by_player: dict[str, str] = {}
@@ -221,6 +242,7 @@ def load_backfill_candidates(
         scoring_format=scoring_format,
         league_format=league_format,
         limit=limit * 2,
+        snapshot_date=ecr_snapshot_date,
     )
     producers = _recent_producer_player_ids(
         client,
@@ -274,10 +296,14 @@ def load_backfill_progress(
     new_reports = 0
     changed_reports = 0
     completed: set[str] = set()
+    pinned_ecr_dates: set[date] = set()
     for row in rows:
         metadata = row.get("metadata")
         if not isinstance(metadata, dict) or metadata.get("backfill_id") != backfill_id:
             continue
+        pinned_ecr = metadata.get("ecr_snapshot_date")
+        if pinned_ecr:
+            pinned_ecr_dates.add(date.fromisoformat(str(pinned_ecr)))
         new_reports += int(row.get("new_reports") or 0)
         changed_reports += int(row.get("changed_reports") or 0)
         fantasypros_id = metadata.get("request_fpid") or metadata.get(
@@ -285,10 +311,115 @@ def load_backfill_progress(
         )
         if row.get("status") == "succeeded" and fantasypros_id is not None:
             completed.add(str(fantasypros_id))
+    if len(pinned_ecr_dates) > 1:
+        values = ", ".join(sorted(value.isoformat() for value in pinned_ecr_dates))
+        raise RuntimeError(f"Backfill {backfill_id} has conflicting ECR pins: {values}")
     return BackfillProgress(
         new_reports=new_reports,
         changed_reports=changed_reports,
         completed_fantasypros_ids=frozenset(completed),
+        ecr_snapshot_date=next(iter(pinned_ecr_dates), None),
+    )
+
+
+def load_or_create_backfill_definition(
+    client: Client,
+    *,
+    backfill_id: str,
+    season: int,
+    scoring_format: str,
+    league_format: str,
+    candidate_limit: int,
+    requested_ecr_snapshot_date: date | None,
+    progress: BackfillProgress,
+    candidate_loader: CandidateLoader,
+) -> BackfillDefinition:
+    """Recover or durably materialize one immutable candidate queue."""
+    rows = (
+        client.table("report_backfills")
+        .select(
+            "backfill_id,provider,season,scoring_format,league_format,"
+            "ecr_snapshot_date,candidate_limit,candidates"
+        )
+        .eq("backfill_id", backfill_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if rows:
+        row = rows[0]
+        expected = {
+            "provider": PROVIDER,
+            "season": season,
+            "scoring_format": scoring_format,
+            "league_format": league_format,
+            "candidate_limit": candidate_limit,
+        }
+        mismatches = {
+            field: (row.get(field), value)
+            for field, value in expected.items()
+            if row.get(field) != value
+        }
+        if mismatches:
+            raise ValueError(
+                f"Backfill {backfill_id} parameters differ from its stored "
+                f"definition: {mismatches}"
+            )
+        pinned = date.fromisoformat(str(row["ecr_snapshot_date"]))
+        if requested_ecr_snapshot_date and requested_ecr_snapshot_date != pinned:
+            raise ValueError(
+                f"Backfill {backfill_id} is pinned to ECR {pinned}; "
+                f"received {requested_ecr_snapshot_date}"
+            )
+        raw_candidates = row.get("candidates")
+        if not isinstance(raw_candidates, list):
+            raise RuntimeError(f"Backfill {backfill_id} has an invalid candidate queue")
+        return BackfillDefinition(
+            ecr_snapshot_date=pinned,
+            candidates=tuple(BackfillCandidate(**item) for item in raw_candidates),
+        )
+
+    pinned = requested_ecr_snapshot_date or progress.ecr_snapshot_date
+    if pinned is None and progress.completed_fantasypros_ids:
+        raise RuntimeError(
+            f"Legacy backfill {backfill_id} has no durable ECR pin. Supply "
+            "--ecr-snapshot-date once to materialize its original queue."
+        )
+    if pinned is None:
+        pinned = _select_ecr_snapshot_date(
+            client,
+            season=season,
+            scoring_format=scoring_format,
+            league_format=league_format,
+            on_or_before=None,
+        )
+    if pinned is None:
+        raise RuntimeError(
+            "No current ECR snapshot is available for the requested backfill format"
+        )
+    candidates = candidate_loader(
+        client,
+        season,
+        scoring_format,
+        league_format,
+        candidate_limit,
+        pinned,
+    )
+    payload = {
+        "backfill_id": backfill_id,
+        "provider": PROVIDER,
+        "season": season,
+        "scoring_format": scoring_format,
+        "league_format": league_format,
+        "ecr_snapshot_date": pinned.isoformat(),
+        "candidate_limit": candidate_limit,
+        "candidates": [asdict(candidate) for candidate in candidates],
+    }
+    client.table("report_backfills").insert(payload).execute()
+    return BackfillDefinition(
+        ecr_snapshot_date=pinned,
+        candidates=tuple(candidates),
     )
 
 
@@ -299,6 +430,7 @@ def default_backfill_id(cutoff_from: date) -> str:
 def _result(
     *,
     backfill_id: str,
+    ecr_snapshot_date: date,
     status: str,
     reason: str | None,
     cutoff_from: date,
@@ -313,6 +445,7 @@ def _result(
 ) -> BackfillResult:
     return BackfillResult(
         backfill_id=backfill_id,
+        ecr_snapshot_date=ecr_snapshot_date.isoformat(),
         status=status,
         reason=reason,
         cutoff_from=cutoff_from.isoformat(),
@@ -341,6 +474,7 @@ def backfill_reports(
     daily_request_budget: int = DEFAULT_DAILY_REQUEST_BUDGET,
     scoring_format: str = "ppr",
     league_format: str = "redraft_1qb",
+    ecr_snapshot_date: date | None = None,
     backfill_id: str | None = None,
     metadata_model: str = "gpt-5.6-luna",
     metadata_batch_size: int = 10,
@@ -352,6 +486,7 @@ def backfill_reports(
     client: Client | None = None,
     openai_client: OpenAI | None = None,
     candidate_loader: CandidateLoader = load_backfill_candidates,
+    definition_loader: DefinitionLoader = load_or_create_backfill_definition,
     refresh_function: Callable[..., RefreshResult] = refresh_reports,
 ) -> BackfillResult:
     """Process a resumable, bounded slice of the historical player queue."""
@@ -374,13 +509,19 @@ def backfill_reports(
 
     supabase_client = client or get_supabase_client()
     progress = load_backfill_progress(supabase_client, backfill_id=identity)
-    candidates = candidate_loader(
+    definition = definition_loader(
         supabase_client,
-        season,
-        scoring_format,
-        league_format,
-        candidate_limit,
+        backfill_id=identity,
+        season=season,
+        scoring_format=scoring_format,
+        league_format=league_format,
+        candidate_limit=candidate_limit,
+        requested_ecr_snapshot_date=ecr_snapshot_date,
+        progress=progress,
+        candidate_loader=candidate_loader,
     )
+    pinned_ecr_date = definition.ecr_snapshot_date
+    candidates = list(definition.candidates)
     pending = [
         candidate
         for candidate in candidates
@@ -390,6 +531,7 @@ def backfill_reports(
     if before >= target_new_reports:
         return _result(
             backfill_id=identity,
+            ecr_snapshot_date=pinned_ecr_date,
             status="complete",
             reason="target_reached",
             cutoff_from=cutoff_from,
@@ -415,6 +557,7 @@ def backfill_reports(
         ]
         return _result(
             backfill_id=identity,
+            ecr_snapshot_date=pinned_ecr_date,
             status="planned",
             reason=None if preview else "candidate_queue_exhausted",
             cutoff_from=cutoff_from,
@@ -456,6 +599,7 @@ def backfill_reports(
                 "candidate_player_id": candidate.player_id,
                 "candidate_display_name": candidate.display_name,
                 "candidate_priority_source": candidate.priority_source,
+                "ecr_snapshot_date": pinned_ecr_date.isoformat(),
                 "target_new_reports": target_new_reports,
             },
             emit_result=False,
@@ -511,6 +655,7 @@ def backfill_reports(
         reason = reason or "request_chunk_complete"
     return _result(
         backfill_id=identity,
+        ecr_snapshot_date=pinned_ecr_date,
         status=status,
         reason=reason,
         cutoff_from=cutoff_from,
@@ -550,6 +695,14 @@ def main() -> None:
     )
     parser.add_argument("--scoring-format", default="ppr")
     parser.add_argument("--league-format", default="redraft_1qb")
+    parser.add_argument(
+        "--ecr-snapshot-date",
+        type=date.fromisoformat,
+        help=(
+            "Pin a new backfill to this current-ECR snapshot date. Existing "
+            "backfills automatically recover their stored/original pin."
+        ),
+    )
     parser.add_argument("--backfill-id")
     parser.add_argument("--metadata-batch-size", type=int, default=10)
     parser.add_argument("--embedding-model", default=DEFAULT_EMBEDDING_MODEL)
@@ -584,6 +737,7 @@ def main() -> None:
         daily_request_budget=args.daily_request_budget,
         scoring_format=args.scoring_format,
         league_format=args.league_format,
+        ecr_snapshot_date=args.ecr_snapshot_date,
         backfill_id=args.backfill_id,
         metadata_model=metadata_model,
         metadata_batch_size=args.metadata_batch_size,

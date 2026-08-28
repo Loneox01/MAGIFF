@@ -260,6 +260,11 @@ class DiscordInteractionRunner:
                         "input_tokens": result.usage.input_tokens,
                         "cached_input_tokens": result.usage.cached_input_tokens,
                         "output_tokens": result.usage.output_tokens,
+                        "estimated_cost_usd": getattr(
+                            result,
+                            "estimated_cost_usd",
+                            None,
+                        ),
                         "tool_calls": len(result.tool_calls),
                         "messages": len(messages),
                     },

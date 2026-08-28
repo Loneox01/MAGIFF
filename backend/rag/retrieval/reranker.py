@@ -30,7 +30,7 @@ from ..planning.resolver import ResolutionResult, ResolvedEntity
 from .store import SearchHit
 
 
-RERANK_PROMPT_VERSION = "6"
+RERANK_PROMPT_VERSION = "7"
 MAX_CANDIDATE_TEXT_CHARS = 1_600
 MAX_RERANK_CANDIDATES = 30
 MAX_CONTEXT_ANCHOR_ENTITIES = 12
@@ -83,6 +83,10 @@ class RerankResponse(RerankModel):
     sufficiency_reason: str
 
 
+class RerankerContractError(RuntimeError):
+    """The model response did not map exactly onto the candidate batch."""
+
+
 @dataclass(frozen=True)
 class RankedCandidate:
     hit: SearchHit
@@ -109,6 +113,7 @@ class RerankResult:
     evidence_sufficiency: str
     sufficiency_reason: str
     error: str | None
+    attempts: int = 0
 
 
 _RELATIONSHIP_BONUS = {
@@ -168,6 +173,7 @@ class ReportReranker:
                         model TEXT NOT NULL,
                         prompt_version TEXT NOT NULL,
                         api_called INTEGER NOT NULL,
+                        attempts INTEGER NOT NULL DEFAULT 0,
                         cache_hit INTEGER NOT NULL,
                         candidate_count INTEGER NOT NULL,
                         output_count INTEGER NOT NULL,
@@ -195,6 +201,11 @@ class ReportReranker:
                     connection.execute(
                         "ALTER TABLE rerank_events ADD COLUMN "
                         "judgments_json TEXT NOT NULL DEFAULT '[]'"
+                    )
+                if "attempts" not in event_columns:
+                    connection.execute(
+                        "ALTER TABLE rerank_events ADD COLUMN "
+                        "attempts INTEGER NOT NULL DEFAULT 0"
                     )
                 yield connection
         finally:
@@ -226,7 +237,7 @@ class ReportReranker:
     def _candidate_payload(hits: list[SearchHit]) -> list[dict[str, object]]:
         return [
             {
-                "document_id": hit.document.id,
+                "candidate_handle": f"C{rank:02d}",
                 "retrieval_rank": rank,
                 "retrieval_method": hit.method,
                 "retrieval_score": hit.score,
@@ -330,15 +341,30 @@ class ReportReranker:
     def _validate_response(
         response: RerankResponse,
         hits: list[SearchHit],
-    ) -> None:
+    ) -> RerankResponse:
+        handles = {
+            f"C{rank:02d}": hit.document.id
+            for rank, hit in enumerate(hits, start=1)
+        }
+        # Exact real IDs remain accepted for cached fixtures and injected test
+        # clients, but production payloads expose only the short handles.
+        identifier_map = {**handles, **{value: value for value in handles.values()}}
         expected = [hit.document.id for hit in hits]
-        returned = [judgment.document_id for judgment in response.judgments]
+        returned_raw = [judgment.document_id for judgment in response.judgments]
+        returned = [identifier_map.get(identifier) for identifier in returned_raw]
+        if any(identifier is None for identifier in returned):
+            raise RerankerContractError(
+                "Reranker must use exactly the supplied candidate handles; "
+                f"expected {sorted(handles)}, got {sorted(returned_raw)}"
+            )
         if len(returned) != len(set(returned)):
-            raise RuntimeError("Reranker returned duplicate document IDs")
+            raise RerankerContractError(
+                "Reranker returned duplicate candidate handles"
+            )
         if set(returned) != set(expected):
-            raise RuntimeError(
-                "Reranker must judge exactly the supplied document IDs; "
-                f"expected {sorted(expected)}, got {sorted(returned)}"
+            raise RerankerContractError(
+                "Reranker must judge exactly the supplied candidate handles; "
+                f"expected {sorted(handles)}, got {sorted(returned_raw)}"
             )
         invalid_scores = [
             judgment.document_id
@@ -346,25 +372,40 @@ class ReportReranker:
             if not 0 <= judgment.relevance_score <= 100
         ]
         if invalid_scores:
-            raise RuntimeError(
+            raise RerankerContractError(
                 "Reranker returned relevance outside 0-100 for "
                 + ", ".join(invalid_scores)
             )
-        candidate_ids = set(expected)
+        normalized_judgments: list[RerankJudgment] = []
         invalid_redundancy = [
             judgment.document_id
             for judgment in response.judgments
             if judgment.redundant_with is not None
             and (
-                judgment.redundant_with not in candidate_ids
-                or judgment.redundant_with == judgment.document_id
+                judgment.redundant_with not in identifier_map
+                or identifier_map[judgment.redundant_with]
+                == identifier_map[judgment.document_id]
             )
         ]
         if invalid_redundancy:
-            raise RuntimeError(
-                "Reranker returned invalid redundant_with IDs for "
+            raise RerankerContractError(
+                "Reranker returned invalid redundant_with handles for "
                 + ", ".join(invalid_redundancy)
             )
+        for judgment in response.judgments:
+            normalized_judgments.append(
+                judgment.model_copy(
+                    update={
+                        "document_id": identifier_map[judgment.document_id],
+                        "redundant_with": (
+                            identifier_map[judgment.redundant_with]
+                            if judgment.redundant_with is not None
+                            else None
+                        ),
+                    }
+                )
+            )
+        return response.model_copy(update={"judgments": normalized_judgments})
 
     @staticmethod
     def _estimated_cost(
@@ -571,18 +612,19 @@ class ReportReranker:
             connection.execute(
                 """
                 INSERT INTO rerank_events (
-                    request_hash, model, prompt_version, api_called, cache_hit,
-                    candidate_count, output_count, ranking_changed, input_tokens,
-                    cached_input_tokens, output_tokens, estimated_cost_usd,
-                    latency_ms, evidence_sufficiency, sufficiency_reason,
-                    judgments_json, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    request_hash, model, prompt_version, api_called, attempts,
+                    cache_hit, candidate_count, output_count, ranking_changed,
+                    input_tokens, cached_input_tokens, output_tokens,
+                    estimated_cost_usd, latency_ms, evidence_sufficiency,
+                    sufficiency_reason, judgments_json, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_hash,
                     result.model,
                     RERANK_PROMPT_VERSION,
                     int(result.api_called),
+                    result.attempts,
                     int(result.cached),
                     result.candidate_count,
                     len(result.hits),
@@ -650,55 +692,101 @@ class ReportReranker:
             return result
 
         cached_response = self._cached_response(request_hash) if use_cache else None
-        api_called = cached_response is None
+        api_called = False
+        used_cache = False
+        attempts = 0
         input_tokens = 0
         cached_input_tokens = 0
         output_tokens = 0
         cost = None
-        try:
-            if cached_response is None:
-                client = self.client or OpenAI()
-                api_response = client.responses.parse(
-                    model=self.model,
-                    reasoning={"effort": "none"},
-                    input=[
-                        {
-                            "role": "system",
-                            "content": REPORT_RERANKER_INSTRUCTIONS,
-                        },
-                        {
-                            "role": "user",
-                            "content": json.dumps(payload, separators=(",", ":")),
-                        },
-                    ],
-                    text_format=RerankResponse,
-                )
-                response = api_response.output_parsed
-                if response is None:
-                    raise RuntimeError("Reranker returned no structured response")
-                usage = api_response.usage
-                input_tokens = usage.input_tokens if usage else 0
-                output_tokens = usage.output_tokens if usage else 0
+
+        def request_response(
+            client: OpenAI,
+            *,
+            correction_error: str | None = None,
+        ) -> RerankResponse:
+            nonlocal attempts
+            nonlocal api_called
+            nonlocal input_tokens
+            nonlocal cached_input_tokens
+            nonlocal output_tokens
+
+            request_payload = payload
+            if correction_error is not None:
+                request_payload = {
+                    **payload,
+                    "contract_correction": {
+                        "instruction": (
+                            "Return one judgment for every supplied "
+                            "candidate_handle and copy handles exactly. Change "
+                            "only identifiers needed to satisfy the contract."
+                        ),
+                        "validation_error": correction_error[:1600],
+                    },
+                }
+            attempts += 1
+            api_called = True
+            api_response = client.responses.parse(
+                model=self.model,
+                reasoning={"effort": "none"},
+                input=[
+                    {
+                        "role": "system",
+                        "content": REPORT_RERANKER_INSTRUCTIONS,
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            request_payload,
+                            separators=(",", ":"),
+                        ),
+                    },
+                ],
+                text_format=RerankResponse,
+            )
+            parsed = api_response.output_parsed
+            if parsed is None:
+                raise RuntimeError("Reranker returned no structured response")
+            usage = api_response.usage
+            if usage is not None:
+                input_tokens += usage.input_tokens
+                output_tokens += usage.output_tokens
                 details = getattr(usage, "input_tokens_details", None)
-                cached_input_tokens = (
-                    (getattr(details, "cached_tokens", 0) or 0)
-                    if details is not None
-                    else 0
-                )
-                cost = self._estimated_cost(
-                    input_tokens,
-                    cached_input_tokens,
-                    output_tokens,
-                )
-                self._validate_response(response, hits)
-                self._cache_response(request_hash, response)
-            else:
-                response = cached_response
-                self._validate_response(response, hits)
-                input_tokens = 0
-                cached_input_tokens = 0
-                output_tokens = 0
-                cost = 0.0
+                if details is not None:
+                    cached_input_tokens += (
+                        getattr(details, "cached_tokens", 0) or 0
+                    )
+            return parsed
+
+        try:
+            response = None
+            if cached_response is not None:
+                try:
+                    response = self._validate_response(cached_response, hits)
+                    used_cache = True
+                except RerankerContractError:
+                    # A stale or malformed cache row must not permanently poison
+                    # this request. Fall through to one fresh attempt.
+                    cached_response = None
+
+            if response is None:
+                client = self.client or OpenAI()
+                raw_response = request_response(client)
+                try:
+                    response = self._validate_response(raw_response, hits)
+                except RerankerContractError as contract_error:
+                    raw_response = request_response(
+                        client,
+                        correction_error=str(contract_error),
+                    )
+                    response = self._validate_response(raw_response, hits)
+                self._cache_response(request_hash, raw_response)
+
+            cost = self._estimated_cost(
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+            )
 
             selected, ranked_candidates = self._compose(
                 hits,
@@ -714,7 +802,7 @@ class ReportReranker:
                 hits=selected,
                 ranked_candidates=ranked_candidates,
                 model=self.model,
-                cached=cached_response is not None,
+                cached=used_cache,
                 api_called=api_called,
                 input_tokens=input_tokens,
                 cached_input_tokens=min(cached_input_tokens, input_tokens),
@@ -726,8 +814,14 @@ class ReportReranker:
                 evidence_sufficiency=response.evidence_sufficiency,
                 sufficiency_reason=response.sufficiency_reason,
                 error=None,
+                attempts=attempts,
             )
         except Exception as error:
+            cost = self._estimated_cost(
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+            )
             result = RerankResult(
                 hits=original,
                 ranked_candidates=(),
@@ -744,6 +838,7 @@ class ReportReranker:
                 evidence_sufficiency=EvidenceSufficiency.WEAK,
                 sufficiency_reason="Reranking failed; original retrieval order retained.",
                 error=str(error),
+                attempts=attempts,
             )
 
         self._log_event(request_hash, result)
@@ -754,7 +849,7 @@ class ReportReranker:
             rows = connection.execute(
                 """
                 SELECT model, api_called, cache_hit, candidate_count,
-                       output_count, ranking_changed, input_tokens,
+                       attempts, output_count, ranking_changed, input_tokens,
                        cached_input_tokens, output_tokens, estimated_cost_usd,
                        latency_ms, evidence_sufficiency, judgments_json, error
                 FROM rerank_events
@@ -775,6 +870,7 @@ class ReportReranker:
         return {
             "executions": len(rows),
             "api_calls": sum(bool(row["api_called"]) for row in rows),
+            "api_attempts": sum(row["attempts"] for row in rows),
             "cache_hits": sum(bool(row["cache_hit"]) for row in rows),
             "failed": sum(bool(row["error"]) for row in rows),
             "ranking_changed": sum(bool(row["ranking_changed"]) for row in rows),

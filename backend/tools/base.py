@@ -12,4 +12,5 @@ class ToolExecutionResult:
     input_tokens: int = 0
     cached_input_tokens: int = 0
     output_tokens: int = 0
+    estimated_cost_usd: float | None = None
     details: dict[str, Any] = field(default_factory=dict)

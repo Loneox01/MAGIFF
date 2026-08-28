@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from model_costs import estimate_component_costs_usd
 from rag.pipeline import ReportRetrievalPipeline
 
 from .base import ToolExecutionResult
@@ -47,12 +48,22 @@ def _pipeline() -> ReportRetrievalPipeline:
     return ReportRetrievalPipeline()
 
 
-def search_reports(query: str, limit: int = 5) -> ToolExecutionResult:
-    result = _pipeline().search(query, limit=limit)
+def search_reports(
+    query: str,
+    limit: int = 5,
+    *,
+    source_question: str | None = None,
+) -> ToolExecutionResult:
+    result = _pipeline().search(
+        query,
+        source_question=source_question,
+        limit=limit,
+    )
     planner = result.telemetry["planner"]
     context_planner = result.telemetry["context_planner"]
     identity = result.telemetry["identity"]
     reranker = result.telemetry["reranker"]
+    model_components = (planner, context_planner, identity, reranker)
     return ToolExecutionResult(
         output=result.agent_output(),
         input_tokens=(
@@ -73,6 +84,7 @@ def search_reports(query: str, limit: int = 5) -> ToolExecutionResult:
             + identity["output_tokens"]
             + reranker["output_tokens"]
         ),
+        estimated_cost_usd=estimate_component_costs_usd(model_components),
         details={
             "component": "report_pipeline",
             "status": result.status.value,

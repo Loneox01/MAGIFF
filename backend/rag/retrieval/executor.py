@@ -9,6 +9,7 @@ from ..planning.enrichment import StructuredEnrichment
 from ..planning.lookups import ContextScopePolicy, LookupPurpose
 from ..planning.planner import QueryPlan
 from ..planning.resolver import ResolutionResult, ResolvedEntity, SelectorResolution
+from ..planning.temporal import ReportTemporalPolicy
 from .store import LocalRAGStore, SearchHit
 
 
@@ -189,54 +190,13 @@ class QueryPlanExecutor:
         limit: int,
         embedding_model: str,
         filters: dict[str, object],
+        temporal_policy: ReportTemporalPolicy,
     ) -> list[SearchHit]:
         pool_size = max(limit * 5, 20)
         temporal_filters = dict(filters)
-
-        if plan.temporal_mode == "after" and plan.start_date:
-            temporal_filters["published_after"] = plan.start_date
-            if plan.end_date:
-                temporal_filters["published_to"] = plan.end_date
-            newer = self._search_once(
-                original_query,
-                keyword_query=keyword_query,
-                vector_query=vector_query,
-                mode=mode,
-                limit=pool_size,
-                embedding_model=embedding_model,
-                filters=temporal_filters,
-            )
-            newer = _newest_first(newer)
-            if not plan.needs_baseline:
-                return newer[:limit]
-
-            baseline_filters = dict(filters)
-            baseline_filters["published_to"] = plan.start_date
-            baseline = self._search_once(
-                original_query,
-                keyword_query=keyword_query,
-                vector_query=vector_query,
-                mode=mode,
-                limit=pool_size,
-                embedding_model=embedding_model,
-                filters=baseline_filters,
-            )
-            return _deduplicate_hits([*newer, *_newest_first(baseline)[:1]])[:limit]
-
-        if plan.temporal_mode == "before":
-            boundary = plan.end_date or plan.start_date
-            if boundary:
-                temporal_filters["published_before"] = boundary
-        elif plan.temporal_mode == "between":
-            if plan.start_date:
-                temporal_filters["published_from"] = plan.start_date
-            if plan.end_date:
-                temporal_filters["published_to"] = plan.end_date
-        else:
-            if plan.start_date and plan.temporal_mode == "timeline":
-                temporal_filters["published_from"] = plan.start_date
-            if plan.end_date:
-                temporal_filters["published_to"] = plan.end_date
+        if temporal_policy.hard_filter_applied:
+            temporal_filters["published_from"] = temporal_policy.hard_start_date
+            temporal_filters["published_to"] = temporal_policy.hard_end_date
 
         hits = self._search_once(
             original_query,
@@ -247,7 +207,7 @@ class QueryPlanExecutor:
             embedding_model=embedding_model,
             filters=temporal_filters,
         )
-        if plan.temporal_mode in {"latest", "current", "before"}:
+        if plan.temporal_mode in {"latest", "current"}:
             hits = _newest_first(hits)
         return hits[:limit]
 
@@ -285,8 +245,10 @@ class QueryPlanExecutor:
         embedding_model: str,
         manual_filters: dict[str, object] | None = None,
         enrichment: StructuredEnrichment | None = None,
+        temporal_policy: ReportTemporalPolicy | None = None,
     ) -> ExecutionResult:
         active_enrichment = enrichment or StructuredEnrichment()
+        active_temporal_policy = temporal_policy or ReportTemporalPolicy()
         players = resolution.players
         active_contexts = [
             context
@@ -315,9 +277,6 @@ class QueryPlanExecutor:
             for key, value in (manual_filters or {}).items()
             if value is not None
         }
-        if plan.season is not None and "season" not in base_filters:
-            base_filters["season"] = plan.season
-
         target_results = [
             item
             for item in resolution.selectors
@@ -374,6 +333,7 @@ class QueryPlanExecutor:
                 limit=branch_limit,
                 embedding_model=embedding_model,
                 filters=filters,
+                temporal_policy=active_temporal_policy,
             )
             hits = self._negative_focus_filter(hits, plan, players)
             branches.append((scope, hits))
@@ -390,6 +350,7 @@ class QueryPlanExecutor:
                 limit=branch_limit,
                 embedding_model=embedding_model,
                 filters=base_filters,
+                temporal_policy=active_temporal_policy,
             )
             hits = self._negative_focus_filter(hits, plan, players)
             branches.append((scope, hits))
@@ -522,6 +483,7 @@ class QueryPlanExecutor:
                 limit=branch_limit,
                 embedding_model=embedding_model,
                 filters=context_filters,
+                temporal_policy=active_temporal_policy,
             )
             context_hits = self._negative_focus_filter(
                 context_hits,

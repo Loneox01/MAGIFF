@@ -36,6 +36,7 @@ STRUCTURED_DOMAIN_TOOLS = {
     ),
     StructuredDomain.ECR: (
         "find_players",
+        "get_player_ecr",
         "rank_players_by_ecr",
         "compare_ecr_to_results",
     ),

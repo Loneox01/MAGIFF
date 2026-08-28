@@ -604,6 +604,65 @@ def _positions(positions: list[str] | None) -> list[str] | None:
     return selected
 
 
+def get_player_ecr(
+    player_id: str,
+    season: int,
+    scoring_format: str,
+    league_format: str,
+    snapshot_type: str,
+    as_of_date: str | None,
+) -> dict:
+    """Get one player's rank from the latest qualifying ECR snapshot."""
+    _ecr_options(scoring_format, league_format, snapshot_type)
+    selected_date, row = repository.get_player_ecr_row(
+        player_id,
+        season,
+        scoring_format,
+        league_format,
+        snapshot_type,
+        as_of_date,
+    )
+    name = repository.get_player_names([player_id]).get(player_id)
+    reason = None
+    if selected_date is None:
+        reason = "No qualifying ECR snapshot is stored for the requested format."
+    elif row is None:
+        reason = "The player is not ranked in the selected ECR snapshot."
+
+    return {
+        "season": season,
+        "scrape_date": selected_date,
+        "scoring_format": scoring_format,
+        "league_format": league_format,
+        "snapshot_type": snapshot_type,
+        **_ecr_roster_context(league_format),
+        "found": row is not None,
+        "reason": reason,
+        "player": (
+            {
+                "player_id": player_id,
+                "display_name": name,
+                "position": row.get("position"),
+                "team": row.get("team"),
+                "overall_rank": row.get("overall_rank"),
+                "position_rank": row.get("position_rank"),
+                "best_rank": row.get("best_rank"),
+                "worst_rank": row.get("worst_rank"),
+                "rank_sd": row.get("rank_sd"),
+                "rank_range": row.get("rank_range"),
+                "rank_delta": row.get("rank_delta"),
+                "source": row.get("source"),
+                "ranking_page": row.get("ranking_page"),
+            }
+            if row is not None
+            else {
+                "player_id": player_id,
+                "display_name": name,
+            }
+        ),
+    }
+
+
 def rank_players_by_ecr(
     season: int,
     positions: list[str] | None,
@@ -828,6 +887,7 @@ TOOL_HANDLERS = {
     "rank_players_by_formula": rank_players_by_formula,
     "rank_teams_by_formula": rank_teams_by_formula,
     "rank_players_by_weekly_threshold": rank_players_by_weekly_threshold,
+    "get_player_ecr": get_player_ecr,
     "rank_players_by_ecr": rank_players_by_ecr,
     "compare_ecr_to_results": compare_ecr_to_results,
 }

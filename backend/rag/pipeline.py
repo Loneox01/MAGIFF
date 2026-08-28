@@ -23,6 +23,7 @@ from .planning.resolver import (
     validate_resolution_bounds,
 )
 from .planning.router import EscalationRouter
+from .planning.temporal import report_temporal_policy
 from .retrieval.executor import QueryPlanExecutor
 from .retrieval.factory import create_report_store
 from .retrieval.reranker import MAX_RERANK_CANDIDATES, ReportReranker
@@ -188,12 +189,16 @@ class ReportRetrievalPipeline:
         self,
         query: str,
         *,
+        source_question: str | None = None,
         limit: int = 5,
         use_cache: bool = True,
     ) -> ReportSearchResult:
         normalized_query = query.strip()
         if not normalized_query:
             raise ValueError("Report search query must not be empty")
+        normalized_source_question = (source_question or query).strip()
+        if not normalized_source_question:
+            raise ValueError("Report source question must not be empty")
         if not 1 <= limit <= 5:
             raise ValueError("Report search limit must be between 1 and 5")
         if self.candidate_limit < limit:
@@ -205,6 +210,7 @@ class ReportRetrievalPipeline:
 
         plan_result = self.planner.plan(
             normalized_query,
+            source_question=normalized_source_question,
             use_cache=use_cache,
         )
         active_plan = plan_result.plan
@@ -229,6 +235,10 @@ class ReportRetrievalPipeline:
             use_cache=use_cache,
         )
         active_plan = context_result.plan
+        temporal_policy = report_temporal_policy(
+            active_plan,
+            normalized_source_question,
+        )
         # Terra may add context branches but cannot change direct selectors.
         # Resolve the merged plan so those new branch anchors and scopes are
         # grounded before any structured lookup or report retrieval executes.
@@ -244,6 +254,7 @@ class ReportRetrievalPipeline:
             limit=self.candidate_limit,
             embedding_model=self.embedding_model,
             enrichment=enrichment,
+            temporal_policy=temporal_policy,
         )
         rerank = self.reranker.rerank(
             normalized_query,
@@ -328,6 +339,13 @@ class ReportRetrievalPipeline:
                 "candidates": len(execution.hits),
                 "branch_candidates": execution.branch_candidates,
                 "linked_document_entities": execution.linked_document_entities,
+                "temporal_policy": {
+                    "basis": active_plan.temporal_basis.value,
+                    "hard_filter_applied": temporal_policy.hard_filter_applied,
+                    "hard_start_date": temporal_policy.hard_start_date,
+                    "hard_end_date": temporal_policy.hard_end_date,
+                    "reason": temporal_policy.reason,
+                },
             },
             "structured_enrichment": {
                 "lookups": sum(
@@ -364,6 +382,7 @@ class ReportRetrievalPipeline:
                 "model": rerank.model,
                 "cached": rerank.cached,
                 "api_called": rerank.api_called,
+                "attempts": rerank.attempts,
                 "input_tokens": rerank.input_tokens,
                 "cached_input_tokens": rerank.cached_input_tokens,
                 "output_tokens": rerank.output_tokens,

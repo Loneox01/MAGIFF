@@ -36,7 +36,7 @@ from .schema_values import (
 )
 
 
-PLANNER_PROMPT_VERSION = "23"
+PLANNER_PROMPT_VERSION = "25"
 
 
 def _nfl_season_for_date(current_date: date) -> int:
@@ -103,6 +103,15 @@ class EntityFilterField(StrEnum):
     OPPONENT = "opponent"
     CONFERENCE = "conference"
     DIVISION = "division"
+
+
+class TemporalBasis(StrEnum):
+    """Provenance for report-time preferences and boundaries."""
+
+    EXPLICIT_USER = "explicit_user"
+    NORMALIZED_USER = "normalized_user"
+    INFERRED = "inferred"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class PlannerModel(BaseModel):
@@ -422,12 +431,28 @@ class QueryPlan(PlannerModel):
             migrated["soft_team_mentions"] = []
         if "context_requests" not in migrated:
             migrated["context_requests"] = []
+        if "temporal_basis" not in migrated:
+            migrated["temporal_basis"] = TemporalBasis.NOT_APPLICABLE
         return migrated
 
     @model_validator(mode="after")
     def _validate_context_requests(self):
         if len(self.context_requests) > 3:
             raise ValueError("A query plan may contain at most three context requests")
+        for selector in self.entity_selectors:
+            if (
+                selector.entity_type == "player"
+                and not selector.names
+                and selector.resolution_basis
+                == PlayerResolutionBasis.NOT_APPLICABLE
+                and not selector.hard_filters
+            ):
+                raise ValueError(
+                    "Player groups require objective hard filters that bound "
+                    "their membership. A nickname or other uncertain reference "
+                    "to one individual must instead supply the best official "
+                    "name hypothesis, confidence, and identity resolution basis."
+                )
         for request in self.context_requests:
             if request.anchor_selector_index >= len(self.entity_selectors):
                 raise ValueError("Context request anchor selector is out of range")
@@ -624,6 +649,16 @@ class QueryPlan(PlannerModel):
         "between",
         "timeline",
     ]
+    temporal_basis: TemporalBasis = Field(
+        default=TemporalBasis.NOT_APPLICABLE,
+        description=(
+            "Origin of the requested report-time scope. explicit_user is "
+            "reserved for a closed start/end range actually stated by the "
+            "user; normalized_user covers partial or relative periods; "
+            "inferred covers recency preferences; not_applicable means no "
+            "temporal preference."
+        ),
+    )
     start_date: str | None
     end_date: str | None
     needs_baseline: bool
@@ -652,6 +687,8 @@ class DirectQueryPlan(PlannerModel):
         migrated = dict(value)
         if "soft_team_mentions" not in migrated:
             migrated["soft_team_mentions"] = []
+        if "temporal_basis" not in migrated:
+            migrated["temporal_basis"] = TemporalBasis.NOT_APPLICABLE
         migrated.pop("context_requests", None)
         return migrated
 
@@ -712,6 +749,16 @@ class DirectQueryPlan(PlannerModel):
         "between",
         "timeline",
     ]
+    temporal_basis: TemporalBasis = Field(
+        default=TemporalBasis.NOT_APPLICABLE,
+        description=(
+            "Origin of the requested report-time scope. explicit_user is "
+            "reserved for a closed start/end range actually stated by the "
+            "user; normalized_user covers partial or relative periods; "
+            "inferred covers recency preferences; not_applicable means no "
+            "temporal preference."
+        ),
+    )
     start_date: str | None
     end_date: str | None
     needs_baseline: bool
@@ -777,8 +824,15 @@ class QueryPlanner:
             connection.close()
 
     @staticmethod
-    def _query_hash(query: str, planning_date: date) -> str:
-        cache_input = f"{planning_date.isoformat()}\n{query.strip()}"
+    def _query_hash(
+        query: str,
+        planning_date: date,
+        source_question: str,
+    ) -> str:
+        cache_input = (
+            f"{planning_date.isoformat()}\n{source_question.strip()}\n"
+            f"{query.strip()}"
+        )
         return hashlib.sha256(cache_input.encode("utf-8")).hexdigest()
 
     def _cached_plan(
@@ -825,13 +879,17 @@ class QueryPlanner:
         self,
         client: OpenAI,
         query: str,
+        source_question: str,
         current_date: date,
         *,
         correction_error: str | None = None,
     ) -> tuple[QueryPlan, int, int, int]:
         user_content = (
             f"{_planner_runtime_context(self.model, current_date)}\n"
-            f"Question: {query}"
+            "Original user question (authoritative for hard constraints): "
+            f"{source_question}\n"
+            "Report retrieval query (semantic guidance only): "
+            f"{query}"
         )
         if correction_error is not None:
             user_content += (
@@ -885,15 +943,23 @@ class QueryPlanner:
         self,
         query: str,
         *,
+        source_question: str | None = None,
         planning_date: date | None = None,
         use_cache: bool = True,
     ) -> QueryPlanResult:
         normalized_query = query.strip()
         if not normalized_query:
             raise ValueError("Planner query must not be empty")
+        normalized_source_question = (source_question or query).strip()
+        if not normalized_source_question:
+            raise ValueError("Planner source question must not be empty")
 
         current_date = planning_date or date.today()
-        query_hash = self._query_hash(normalized_query, current_date)
+        query_hash = self._query_hash(
+            normalized_query,
+            current_date,
+            normalized_source_question,
+        )
 
         if use_cache:
             cached_plan = self._cached_plan(query_hash)
@@ -917,7 +983,12 @@ class QueryPlanner:
                     input_tokens,
                     cached_input_tokens,
                     output_tokens,
-                ) = self._request_plan(client, normalized_query, current_date)
+                ) = self._request_plan(
+                    client,
+                    normalized_query,
+                    normalized_source_question,
+                    current_date,
+                )
             except ValidationError as error:
                 retry_reason = str(error)
                 attempts += 1
@@ -929,6 +1000,7 @@ class QueryPlanner:
                 ) = self._request_plan(
                     client,
                     normalized_query,
+                    normalized_source_question,
                     current_date,
                     correction_error=retry_reason,
                 )

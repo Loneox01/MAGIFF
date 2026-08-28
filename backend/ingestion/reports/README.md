@@ -73,8 +73,11 @@ inside the backend job and must never be exposed to Vercel/browser code.
 The news endpoint has no documented page cursor. The backfill therefore uses
 its supported FantasyPros-player-ID filter and builds a relevance-first queue
 from current ECR, prior-season PPR production, and active QB/RB/WR/TE records.
-It uses the same hashes, metadata processor, embedding loader, ingestion lease,
-and rolling request ledger as the continuous job.
+On its first invocation, that complete ordered queue and its exact ECR snapshot
+date are stored in `report_backfills`. Resumed runs reuse the immutable queue,
+so later ECR, roster, or identity refreshes cannot reorder an in-progress
+backfill. It uses the same hashes, metadata processor, embedding loader,
+ingestion lease, and rolling request ledger as the continuous job.
 
 First preview the next chunk. This reads Supabase state but does not call
 FantasyPros or OpenAI:
@@ -112,6 +115,19 @@ target counts only reports newly added by this backfill, and database report
 IDs still deduplicate anything the hourly feed already captured. A manual run
 automatically pauses when the shared 40-request rolling budget or ingestion
 lease prevents another call.
+
+Backfills created before the durable state table require one explicit recovery
+pin. This materializes the old queue without calling FantasyPros:
+
+```bash
+python -m jobs.backfill_reports \
+  --from 2026-01-01 \
+  --target-reports 500 \
+  --ecr-snapshot-date 2026-08-14 \
+  --plan
+```
+
+Afterward, omit `--ecr-snapshot-date`; the stored definition is authoritative.
 
 Each player request asks for up to 100 reports and then applies the inclusive
 publication cutoff locally. If `possible_coverage_gap=true`, the provider filled

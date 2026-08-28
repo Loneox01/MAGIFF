@@ -44,6 +44,14 @@ NULLABLE_POSITION = {
     "anyOf": [{"type": "string"}, {"type": "null"}],
     "description": "Position abbreviation such as QB or WR, or null.",
 }
+PLAYER_REFERENCE = {
+    "type": "string",
+    "description": (
+        "Canonical player name or an internal player UUID. Names are resolved "
+        "by the backend; use find_players only for explicit discovery or when "
+        "an earlier call reports an ambiguous match."
+    ),
+}
 
 
 def nullable_field_list(values: list[str], description: str) -> dict:
@@ -58,7 +66,10 @@ def nullable_field_list(values: list[str], description: str) -> dict:
 FIND_PLAYERS_TOOL = {
     "type": "function",
     "name": "find_players",
-    "description": "Find an NFL player and their internal player ID by name.",
+    "description": (
+        "Find NFL player candidates by name. Use for discovery or ambiguity; "
+        "other single-player tools accept a name directly as player_ref."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -73,16 +84,16 @@ FIND_PLAYERS_TOOL = {
 GET_PLAYER_WEEKLY_STATS_TOOL = {
     "type": "function",
     "name": "get_player_weekly_stats",
-    "description": "Get recent weekly NFL statistics for a player identified by find_players.",
+    "description": "Get recent weekly NFL statistics for one player.",
     "parameters": {
         "type": "object",
         "properties": {
-            "player_id": {"type": "string", "description": "Internal player UUID."},
+            "player_ref": PLAYER_REFERENCE,
             "season": {"type": "integer", "description": "Four-digit NFL season."},
             "week": NULLABLE_WEEK,
             "fields": NULLABLE_FIELDS,
         },
-        "required": ["player_id", "season", "week", "fields"],
+        "required": ["player_ref", "season", "week", "fields"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -112,7 +123,7 @@ GET_PLAYER_SEASON_STATS_TOOL = {
     "parameters": {
         "type": "object",
         "properties": {
-            "player_id": {"type": "string", "description": "Internal player UUID."},
+            "player_ref": PLAYER_REFERENCE,
             "season": {"type": "integer", "description": "Four-digit NFL season."},
             "season_type": NULLABLE_SEASON_TYPE,
             "fields": nullable_field_list(
@@ -120,7 +131,7 @@ GET_PLAYER_SEASON_STATS_TOOL = {
                 "Season statistics to return, or null for common fantasy totals.",
             ),
         },
-        "required": ["player_id", "season", "season_type", "fields"],
+        "required": ["player_ref", "season", "season_type", "fields"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -175,11 +186,11 @@ GET_PLAYER_SNAP_COUNTS_TOOL = {
     "parameters": {
         "type": "object",
         "properties": {
-            "player_id": {"type": "string", "description": "Internal player UUID."},
+            "player_ref": PLAYER_REFERENCE,
             "season": {"type": "integer", "description": "Four-digit NFL season."},
             "week": NULLABLE_WEEK,
         },
-        "required": ["player_id", "season", "week"],
+        "required": ["player_ref", "season", "week"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -349,7 +360,7 @@ RANK_PLAYERS_BY_WEEKLY_THRESHOLD_TOOL = {
         "participation denominator explicitly: stat_row evaluates games with a "
         "stats row; active_roster includes active zero-production games; "
         "team_games includes every rostered team-game week, including injury or "
-        "reserve absences. Pass player_ids from a preceding player-ranking call "
+        "reserve absences. Pass player_refs from a preceding player-ranking call "
         "when the question limits analysis to a specific candidate pool. Formula "
         "supports numbers, parentheses, +, -, *, and /."
     ),
@@ -392,7 +403,7 @@ RANK_PLAYERS_BY_WEEKLY_THRESHOLD_TOOL = {
             },
             "season_type": NULLABLE_SEASON_TYPE,
             "position": NULLABLE_POSITION,
-            "player_ids": {
+            "player_refs": {
                 "anyOf": [
                     {
                         "type": "array",
@@ -403,8 +414,9 @@ RANK_PLAYERS_BY_WEEKLY_THRESHOLD_TOOL = {
                     {"type": "null"},
                 ],
                 "description": (
-                    "Optional candidate pool of 1-20 internal player IDs, usually "
-                    "copied from rank_players_by_formula; null searches everyone."
+                    "Optional candidate pool of 1-20 canonical player names or "
+                    "internal UUIDs, often copied from a preceding ranking; null "
+                    "searches everyone."
                 ),
             },
             "minimum_games": {
@@ -446,7 +458,7 @@ RANK_PLAYERS_BY_WEEKLY_THRESHOLD_TOOL = {
             "participation_basis",
             "season_type",
             "position",
-            "player_ids",
+            "player_refs",
             "minimum_games",
             "rank_by",
             "sort_direction",
@@ -494,6 +506,67 @@ def nullable_ecr_positions(values: list[str], description: str) -> dict:
         ],
         "description": description,
     }
+
+
+GET_PLAYER_ECR_TOOL = {
+    "type": "function",
+    "name": "get_player_ecr",
+    "description": (
+        "Get one identified player's ECR from the latest matching snapshot on or "
+        "before as_of_date. Pass a canonical name or internal UUID as player_ref. "
+        "Use this instead of a leaderboard call when "
+        "the user asks for a specific player's rank, positional rank, expert range, "
+        "or ranking movement. FantasyPros redraft ECR assumes three starting WR "
+        "slots; mention that mismatch when it materially affects interpretation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "player_ref": PLAYER_REFERENCE,
+            "season": {"type": "integer", "minimum": 2019},
+            "scoring_format": {
+                "type": "string",
+                "enum": ["ppr", "source_default"],
+                "description": (
+                    "Use ppr for redraft formats and source_default for formats "
+                    "whose source page does not state a scoring system."
+                ),
+            },
+            "league_format": {
+                "type": "string",
+                "enum": [
+                    "redraft_1qb",
+                    "redraft_superflex",
+                    "dynasty_1qb",
+                    "dynasty_superflex",
+                    "dynasty_rookie",
+                    "best_ball",
+                    "redraft_idp",
+                    "dynasty_idp",
+                ],
+            },
+            "snapshot_type": {
+                "type": "string",
+                "enum": ["current", "final_preseason", "season_opening"],
+            },
+            "as_of_date": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "description": "YYYY-MM-DD cutoff, or null for the latest snapshot.",
+            },
+        },
+        "required": [
+            "player_ref",
+            "season",
+            "scoring_format",
+            "league_format",
+            "snapshot_type",
+            "as_of_date",
+        ],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
 
 RANK_PLAYERS_BY_ECR_TOOL = {
     "type": "function",
@@ -690,6 +763,7 @@ NFL_TOOLS = [
     RANK_PLAYERS_BY_FORMULA_TOOL,
     RANK_TEAMS_BY_FORMULA_TOOL,
     RANK_PLAYERS_BY_WEEKLY_THRESHOLD_TOOL,
+    GET_PLAYER_ECR_TOOL,
     RANK_PLAYERS_BY_ECR_TOOL,
     COMPARE_ECR_TO_RESULTS_TOOL,
 ]

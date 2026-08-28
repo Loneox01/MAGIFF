@@ -104,6 +104,7 @@ ECR_FIELDS = [
     "position",
     "team",
     "source",
+    "ranking_page",
 ]
 
 
@@ -502,15 +503,15 @@ def get_player_names(player_ids: list[str]) -> dict[str, str]:
     return {row["player_id"]: row["display_name"] for row in rows}
 
 
-def get_ecr_rows(
+def _get_ecr_snapshot_date(
+    client,
     season: int,
     scoring_format: str,
     league_format: str,
     snapshot_type: str,
     as_of_date: str | None,
-) -> tuple[str | None, list[dict]]:
-    """Fetch the latest qualifying ECR snapshot and all its player rows."""
-    client = get_supabase_client()
+) -> str | None:
+    """Return the newest stored snapshot date matching one ECR format."""
     date_query = (
         client.table("player_ecr")
         .select("scrape_date")
@@ -522,10 +523,29 @@ def get_ecr_rows(
     if as_of_date is not None:
         date_query = date_query.lte("scrape_date", as_of_date)
     dates = date_query.order("scrape_date", desc=True).limit(1).execute().data
-    if not dates:
+    return dates[0]["scrape_date"] if dates else None
+
+
+def get_ecr_rows(
+    season: int,
+    scoring_format: str,
+    league_format: str,
+    snapshot_type: str,
+    as_of_date: str | None,
+) -> tuple[str | None, list[dict]]:
+    """Fetch the latest qualifying ECR snapshot and all its player rows."""
+    client = get_supabase_client()
+    selected_date = _get_ecr_snapshot_date(
+        client,
+        season,
+        scoring_format,
+        league_format,
+        snapshot_type,
+        as_of_date,
+    )
+    if selected_date is None:
         return None, []
 
-    selected_date = dates[0]["scrape_date"]
     rows = (
         client.table("player_ecr")
         .select(",".join(ECR_FIELDS))
@@ -540,6 +560,66 @@ def get_ecr_rows(
         .data
     )
     return selected_date, rows
+
+
+def get_player_ecr_row(
+    player_id: str,
+    season: int,
+    scoring_format: str,
+    league_format: str,
+    snapshot_type: str,
+    as_of_date: str | None,
+) -> tuple[str | None, dict | None]:
+    """Fetch one player's ECR from the latest qualifying stored snapshot."""
+    client = get_supabase_client()
+    selected_date = _get_ecr_snapshot_date(
+        client,
+        season,
+        scoring_format,
+        league_format,
+        snapshot_type,
+        as_of_date,
+    )
+    if selected_date is None:
+        return None, None
+
+    filters = {
+        "season": season,
+        "scoring_format": scoring_format,
+        "league_format": league_format,
+        "snapshot_type": snapshot_type,
+        "scrape_date": selected_date,
+    }
+    row_query = client.table("player_ecr").select(",".join(ECR_FIELDS))
+    for field, value in filters.items():
+        row_query = row_query.eq(field, value)
+    rows = row_query.eq("player_id", player_id).limit(1).execute().data
+    if not rows:
+        return selected_date, None
+
+    row = rows[0]
+    row["rank_range"] = (
+        row["worst_rank"] - row["best_rank"]
+        if row.get("worst_rank") is not None and row.get("best_rank") is not None
+        else None
+    )
+    position = row.get("position")
+    if position and row.get("overall_rank") is not None:
+        rank_query = client.table("player_ecr").select(
+            "player_id", count="exact", head=True
+        )
+        for field, value in filters.items():
+            rank_query = rank_query.eq(field, value)
+        rank_response = (
+            rank_query.eq("position", position)
+            .lt("overall_rank", row["overall_rank"])
+            .execute()
+        )
+        row["position_rank"] = (rank_response.count or 0) + 1
+    else:
+        row["position_rank"] = None
+
+    return selected_date, row
 
 
 def get_season_fantasy_results(season: int) -> list[dict]:

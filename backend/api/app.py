@@ -227,6 +227,7 @@ def create_app(
                     "input_tokens": result.usage.input_tokens,
                     "cached_input_tokens": result.usage.cached_input_tokens,
                     "output_tokens": result.usage.output_tokens,
+                    "estimated_cost_usd": result.estimated_cost_usd,
                     "tool_calls": len(result.tool_calls),
                     "router_fallback": result.route.fallback_used,
                 },

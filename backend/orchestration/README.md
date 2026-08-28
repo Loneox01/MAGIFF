@@ -21,6 +21,14 @@ request router (Luna, structured output, daily local cache)
 main answer agent (Terra)
 ```
 
+Single-player model tools accept either a canonical player name or an internal
+UUID as `player_ref`. A request-scoped resolver translates names to UUIDs once,
+returns explicit ambiguity candidates instead of guessing, and leaves the
+repository/tool implementations UUID-based. Independent function calls emitted
+in one model response execute concurrently in a bounded worker pool; their
+outputs are returned in original call order, while genuinely dependent work
+continues in a later model round.
+
 Structured domains currently map to player lookup, player statistics, team
 statistics, schedules, rosters/depth charts, and ECR. Multiple domains and the
 report capability can be selected for mixed questions. If the router call fails,

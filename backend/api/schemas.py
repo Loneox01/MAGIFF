@@ -60,6 +60,7 @@ class AgentQueryResponse(ApiModel):
     usage: TokenUsageResponse
     route: RouteTelemetryResponse
     tool_calls: list[ToolCallTelemetryResponse]
+    estimated_cost_usd: float | None = Field(default=None, ge=0)
 
 
 class HealthResponse(ApiModel):

@@ -10,7 +10,11 @@ from openai.lib._pydantic import to_strict_json_schema
 from pydantic import ValidationError
 
 from rag.documents import parse_report
-from rag.planning.context_planner import ContextPlan, ContextPlanner
+from rag.planning.context_planner import (
+    ContextPlan,
+    ContextPlanner,
+    merge_context_plan,
+)
 from rag.planning.enrichment import (
     ContextEnrichment,
     LookupExecution,
@@ -30,6 +34,7 @@ from rag.planning.planner import (
     ContextRequest,
     DirectQueryPlan,
     PlayerSelector,
+    PositionGroupFilter,
     QueryPlan,
     TeamSelector,
 )
@@ -177,6 +182,81 @@ def london_resolution(plan: QueryPlan) -> tuple[ResolutionResult, ResolvedEntity
 
 
 class RagArchitectureTests(unittest.TestCase):
+    def test_context_merge_downgrades_unbacked_lookup_scopes(self) -> None:
+        direct_plan = plan_with_context().model_copy(
+            update={"context_requests": []}
+        )
+        context_plan = ContextPlan(
+            context_needed=True,
+            rationale="Indirect evidence may affect the comparison.",
+            context_requests=[
+                ContextRequest(
+                    anchor_selector_index=0,
+                    relation="comparison",
+                    semantic_query="related comparison evidence",
+                    keyword_query="related comparison evidence",
+                    semantic_qualifiers=[],
+                    scope_policy=ContextScopePolicy.LOOKUP_ENTITIES,
+                    structured_lookups=[],
+                ),
+                ContextRequest(
+                    anchor_selector_index=0,
+                    relation="environment",
+                    semantic_query="team environment evidence",
+                    keyword_query="team environment evidence",
+                    semantic_qualifiers=[],
+                    scope_policy=ContextScopePolicy.ANCHOR_AND_LOOKUP_TEAMS,
+                    structured_lookups=[],
+                ),
+            ],
+        )
+
+        merged = merge_context_plan(direct_plan, context_plan)
+
+        self.assertEqual(
+            merged.context_requests[0].scope_policy,
+            ContextScopePolicy.SEMANTIC_ONLY,
+        )
+        self.assertEqual(
+            merged.context_requests[1].scope_policy,
+            ContextScopePolicy.ANCHOR_TEAMS,
+        )
+
+    def test_context_merge_preserves_lookup_backed_scope(self) -> None:
+        direct_plan = plan_with_context().model_copy(
+            update={"context_requests": []}
+        )
+        context_plan = ContextPlan(
+            context_needed=True,
+            rationale="A schedule lookup grounds the opponent scope.",
+            context_requests=[
+                ContextRequest(
+                    anchor_selector_index=0,
+                    relation="matchup",
+                    semantic_query="opponent matchup evidence",
+                    keyword_query="opponent matchup evidence",
+                    semantic_qualifiers=[],
+                    scope_policy=ContextScopePolicy.ANCHOR_AND_LOOKUP_TEAMS,
+                    structured_lookups=[
+                        TeamScheduleLookup(
+                            lookup_id="week-one-opponent",
+                            operation="team_schedule",
+                            purpose="resolve_relationship",
+                            season=2026,
+                            week=1,
+                        )
+                    ],
+                )
+            ],
+        )
+
+        merged = merge_context_plan(direct_plan, context_plan)
+
+        self.assertEqual(
+            merged.context_requests[0].scope_policy,
+            ContextScopePolicy.ANCHOR_AND_LOOKUP_TEAMS,
+        )
+
     def test_query_plan_schema_uses_supported_structured_output_composition(
         self,
     ) -> None:
@@ -441,7 +521,13 @@ class RagArchitectureTests(unittest.TestCase):
             names=[],
             identity_confidence=0,
             resolution_basis="not_applicable",
-            hard_filters=[],
+            hard_filters=[
+                PositionGroupFilter(
+                    field="position_group",
+                    operator="eq",
+                    values=["RB"],
+                )
+            ],
             soft_filters=[],
             semantic_qualifiers=["backfield usage"],
         )

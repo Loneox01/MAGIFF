@@ -28,7 +28,7 @@ from .planner import PlayerResolutionBasis, PlayerSelector, QueryPlan
 from .resolver import EntityResolver, ResolutionResult
 
 
-ESCALATION_PROMPT_VERSION = "6"
+ESCALATION_PROMPT_VERSION = "7"
 MAX_ESCALATION_DATABASE_CANDIDATES = 8
 
 MIN_CONFIDENCE_BY_BASIS = {
@@ -496,6 +496,23 @@ class EscalationRouter:
                 if resolved is not None
                 else ["selector was not evaluated"]
             )
+            grounded_peer_players = [
+                PlayerIdentityCandidate(
+                    player_id=match.entity_id,
+                    display_name=match.display_name,
+                    team=match.team,
+                    position=match.position,
+                    position_group=match.position_group,
+                    jersey_number=match.jersey_number,
+                    roster_status=match.roster_status,
+                    rookie_season=match.rookie_season,
+                    draft_year=match.draft_year,
+                ).model_dump(mode="json")
+                for peer in resolution.selectors
+                if peer.selector_index != index and peer.status == "resolved"
+                for match in peer.matches
+                if match.entity_type == "player"
+            ][:MAX_ESCALATION_DATABASE_CANDIDATES]
             reasons: list[EscalationReason] = []
 
             if len(selector.names) != 1:
@@ -584,6 +601,7 @@ class EscalationRouter:
                         "semantic_qualifiers": list(
                             selector.semantic_qualifiers
                         ),
+                        "grounded_peer_players": grounded_peer_players,
                     },
                 )
             )

@@ -27,6 +27,7 @@ from rag.planning.planner import (
     PositionGroupFilter,
     QueryPlan,
     QueryPlanner,
+    TemporalBasis,
     TeamCodeFilter,
     TeamSelector,
 )
@@ -69,6 +70,7 @@ from rag.planning.router import (
     PlayerIdentityDecision,
     PlayerIdentityResponse,
 )
+from rag.planning.temporal import report_temporal_policy
 
 
 REPORT = """---
@@ -853,6 +855,86 @@ class RagTests(unittest.TestCase):
             )
             self.assertIn(
                 "Specific-player target lookups",
+                retry_input[1]["content"],
+            )
+
+    def test_query_planner_retries_unbounded_alias_misclassified_as_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            wicks = PlayerSelector(
+                entity_type="player",
+                reference_text="Dontayvion Wick",
+                names=["Dontayvion Wicks"],
+                identity_confidence=1.0,
+                resolution_basis=PlayerResolutionBasis.EXACT_NAME,
+                filters=[],
+                semantic_qualifiers=["workload bump"],
+            )
+            smith = PlayerSelector(
+                entity_type="player",
+                reference_text="Smitty",
+                names=["DeVonta Smith"],
+                identity_confidence=0.75,
+                resolution_basis=PlayerResolutionBasis.CONTEXTUAL_ALIAS,
+                filters=[],
+                semantic_qualifiers=["injury"],
+            )
+            corrected_plan = QueryPlan(
+                semantic_query="Dontayvion Wicks role after Smitty's injury",
+                keyword_query="Dontayvion Wicks Smitty injury workload",
+                intent="projection",
+                player_mentions=["Dontayvion Wicks", "DeVonta Smith"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[wicks, smith],
+                season=2026,
+                week=None,
+                temporal_mode="current",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="multiple_documents",
+            )
+            invalid_plan = corrected_plan.model_dump(mode="json")
+            invalid_plan["entity_selectors"][1].update(
+                {
+                    "names": [],
+                    "identity_confidence": 0.0,
+                    "resolution_basis": "not_applicable",
+                }
+            )
+            responses = Mock(
+                side_effect=[
+                    SimpleNamespace(
+                        output_parsed=invalid_plan,
+                        usage=SimpleNamespace(input_tokens=50, output_tokens=20),
+                    ),
+                    SimpleNamespace(
+                        output_parsed=corrected_plan,
+                        usage=SimpleNamespace(input_tokens=55, output_tokens=21),
+                    ),
+                ]
+            )
+            planner = QueryPlanner(
+                index_path=Path(directory) / "index.sqlite3",
+                model="gpt-5.6-luna",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=responses)
+                ),
+            )
+
+            result = planner.plan(
+                "Dontayvion Wick's role opened up after Smitty's injury",
+                planning_date=date(2026, 8, 24),
+                use_cache=False,
+            )
+
+            self.assertEqual(responses.call_count, 2)
+            self.assertEqual(result.plan, corrected_plan)
+            self.assertTrue(result.retried)
+            self.assertIn("Player groups require objective hard filters", result.retry_reason)
+            retry_input = responses.call_args_list[1].kwargs["input"]
+            self.assertIn(
+                "nickname or other uncertain reference",
                 retry_input[1]["content"],
             )
 
@@ -1790,6 +1872,103 @@ class RagTests(unittest.TestCase):
         self.assertFalse(result.event.triggered)
         self.assertEqual(result.event.signals[0].reasons, ())
 
+    def test_identity_escalation_includes_grounded_peer_players(self) -> None:
+        wicks = PlayerSelector(
+            entity_type="player",
+            reference_text="Dontayvion Wick",
+            names=["Dontayvion Wicks"],
+            identity_confidence=0.98,
+            resolution_basis=PlayerResolutionBasis.KNOWN_ALIAS,
+            filters=[],
+            semantic_qualifiers=["workload bump"],
+        )
+        smitty = PlayerSelector(
+            entity_type="player",
+            reference_text="Smitty",
+            names=["DeVonta Smith"],
+            identity_confidence=0.55,
+            resolution_basis=PlayerResolutionBasis.INFERRED,
+            filters=[],
+            semantic_qualifiers=["injury"],
+        )
+        plan = QueryPlan(
+            semantic_query="Dontayvion Wicks role after Smitty injury",
+            keyword_query="Dontayvion Wicks Smitty injury workload",
+            intent="projection",
+            player_mentions=["Dontayvion Wicks", "DeVonta Smith"],
+            team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[wicks, smitty],
+            season=2026,
+            week=None,
+            temporal_mode="current",
+            start_date=None,
+            end_date=None,
+            needs_baseline=False,
+            evidence_strategy="multiple_documents",
+        )
+        resolution = ResolutionResult(
+            selectors=[
+                SelectorResolution(
+                    selector_index=0,
+                    selector=wicks,
+                    status="resolved",
+                    matches=[
+                        ResolvedEntity(
+                            entity_type="player",
+                            entity_id="wicks-id",
+                            display_name="Dontayvion Wicks",
+                            team="PHI",
+                            position="WR",
+                            position_group="WR",
+                        )
+                    ],
+                    unresolved_filters=[],
+                    semantic_qualifiers=[],
+                    truncated=False,
+                ),
+                SelectorResolution(
+                    selector_index=1,
+                    selector=smitty,
+                    status="multiple",
+                    matches=[
+                        ResolvedEntity(
+                            entity_type="player",
+                            entity_id="smith-wr-id",
+                            display_name="DeVonta Smith",
+                            team="PHI",
+                            position="WR",
+                            position_group="WR",
+                        ),
+                        ResolvedEntity(
+                            entity_type="player",
+                            entity_id="smith-cb-id",
+                            display_name="Devonta Smith",
+                            team="CAR",
+                            position="CB",
+                            position_group="DB",
+                        ),
+                    ],
+                    unresolved_filters=[],
+                    semantic_qualifiers=[],
+                    truncated=False,
+                ),
+            ]
+        )
+        router = EscalationRouter(model="test-sol")
+
+        issues, _ = router._evaluate_player_identities(
+            plan,
+            resolution,
+            resolver=Mock(),
+        )
+
+        self.assertEqual(len(issues), 1)
+        peers = issues[0].context["grounded_peer_players"]
+        self.assertEqual(len(peers), 1)
+        self.assertEqual(peers[0]["player_id"], "wicks-id")
+        self.assertEqual(peers[0]["team"], "PHI")
+
     def test_suffix_variant_candidates_are_sent_through_existing_escalation(self) -> None:
         class FakeRepository:
             def list_teams(self) -> list[dict]:
@@ -2650,8 +2829,182 @@ class RagTests(unittest.TestCase):
 
             self.assertEqual(result.hits, hits)
             self.assertIsNotNone(result.error)
-            self.assertIn("exactly the supplied document IDs", result.error)
+            self.assertIn("exactly the supplied candidate handles", result.error)
+            self.assertEqual(result.attempts, 2)
             self.assertEqual(reranker.stats()["failed"], 1)
+
+    def test_report_temporal_gate_requires_verified_explicit_closed_range(
+        self,
+    ) -> None:
+        plan = QueryPlan(
+            semantic_query="Alpha reports during the requested range",
+            keyword_query="Alpha July 2026",
+            intent="timeline",
+            player_mentions=["Alpha Runner"],
+            team_mentions=[],
+            negative_focus=[],
+            entity_selectors=[],
+            season=2026,
+            week=None,
+            temporal_mode="between",
+            temporal_basis=TemporalBasis.EXPLICIT_USER,
+            start_date="2026-07-01",
+            end_date="2026-07-31",
+            needs_baseline=False,
+            evidence_strategy="timeline",
+        )
+
+        authorized = report_temporal_policy(
+            plan,
+            "Only use reports from July 1 through July 31, 2026.",
+        )
+        self.assertTrue(authorized.hard_filter_applied)
+        self.assertEqual(authorized.hard_start_date, "2026-07-01")
+        self.assertEqual(authorized.hard_end_date, "2026-07-31")
+
+        invented = report_temporal_policy(
+            plan,
+            "What is the latest Alpha Runner update?",
+        )
+        self.assertFalse(invented.hard_filter_applied)
+
+        normalized = report_temporal_policy(
+            plan.model_copy(
+                update={"temporal_basis": TemporalBasis.NORMALIZED_USER}
+            ),
+            "What happened with Alpha Runner in July?",
+        )
+        self.assertFalse(normalized.hard_filter_applied)
+
+    def test_reranker_retries_once_with_short_candidate_handles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = root / "alpha.md"
+            report_path.write_text(REPORT, encoding="utf-8")
+            template = parse_report(report_path)
+            first_hit = SearchHit(
+                replace(template, id="alpha-tight-end-update"),
+                0.04,
+                "hybrid",
+                1,
+                1,
+            )
+            second_hit = SearchHit(
+                replace(template, id="alpha-role-update"),
+                0.03,
+                "hybrid",
+                2,
+                2,
+            )
+            responses = [
+                RerankResponse(
+                    judgments=[
+                        RerankJudgment(
+                            document_id="C01",
+                            relevance_score=90,
+                            relationship=EvidenceRelationship.DIRECT,
+                            temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
+                            redundant_with=None,
+                            reason="Direct update.",
+                        ),
+                        RerankJudgment(
+                            document_id="C_02",
+                            relevance_score=50,
+                            relationship=EvidenceRelationship.SUPPORTING_CONTEXT,
+                            temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
+                            redundant_with=None,
+                            reason="Malformed handle for retry coverage.",
+                        ),
+                    ],
+                    evidence_sufficiency=EvidenceSufficiency.STRONG,
+                    sufficiency_reason="First response has one malformed handle.",
+                ),
+                RerankResponse(
+                    judgments=[
+                        RerankJudgment(
+                            document_id="C01",
+                            relevance_score=90,
+                            relationship=EvidenceRelationship.DIRECT,
+                            temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
+                            redundant_with=None,
+                            reason="Direct update.",
+                        ),
+                        RerankJudgment(
+                            document_id="C02",
+                            relevance_score=50,
+                            relationship=EvidenceRelationship.SUPPORTING_CONTEXT,
+                            temporal_role=TemporalRole.CURRENT,
+                            condition_alignment=ConditionAlignment.NOT_APPLICABLE,
+                            redundant_with=None,
+                            reason="Supporting update.",
+                        ),
+                    ],
+                    evidence_sufficiency=EvidenceSufficiency.STRONG,
+                    sufficiency_reason="Both supplied candidates were judged.",
+                ),
+            ]
+            request_payloads = []
+
+            def parse(**kwargs):
+                request_payloads.append(json.loads(kwargs["input"][1]["content"]))
+                return SimpleNamespace(
+                    output_parsed=responses[len(request_payloads) - 1],
+                    usage=SimpleNamespace(
+                        input_tokens=100,
+                        output_tokens=20,
+                        input_tokens_details=SimpleNamespace(cached_tokens=10),
+                    ),
+                )
+
+            plan = QueryPlan(
+                semantic_query="Alpha role",
+                keyword_query="Alpha role",
+                intent="current_status",
+                player_mentions=["Alpha Runner"],
+                team_mentions=[],
+                negative_focus=[],
+                entity_selectors=[],
+                season=2026,
+                week=None,
+                temporal_mode="current",
+                start_date=None,
+                end_date=None,
+                needs_baseline=False,
+                evidence_strategy="multiple_documents",
+            )
+            reranker = ReportReranker(
+                index_path=root / "index.sqlite3",
+                model="test-luna",
+                client=SimpleNamespace(
+                    responses=SimpleNamespace(parse=parse)
+                ),
+            )
+
+            result = reranker.rerank(
+                "What is Alpha's role?",
+                plan,
+                ResolutionResult(selectors=[]),
+                [first_hit, second_hit],
+                limit=2,
+            )
+
+            self.assertIsNone(result.error)
+            self.assertEqual(result.attempts, 2)
+            self.assertEqual(result.input_tokens, 200)
+            self.assertEqual(result.cached_input_tokens, 20)
+            self.assertEqual(
+                [item["candidate_handle"] for item in request_payloads[0]["candidates"]],
+                ["C01", "C02"],
+            )
+            self.assertNotIn("document_id", request_payloads[0]["candidates"][0])
+            self.assertIn("contract_correction", request_payloads[1])
+            self.assertEqual(
+                [hit.document.id for hit in result.hits],
+                ["alpha-tight-end-update", "alpha-role-update"],
+            )
 
     def test_reranker_deterministically_preserves_timeline_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

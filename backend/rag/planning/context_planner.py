@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from prompts import CONTEXT_REPORT_PLANNER_INSTRUCTIONS
 
 from ..config import DEFAULT_CONTEXT_PLANNER_MODEL, DEFAULT_INDEX_PATH
+from .lookups import ContextScopePolicy, LookupPurpose
 from .planner import ContextRequest, QueryPlan
 from .resolver import ResolutionResult
 
@@ -112,14 +113,32 @@ def merge_context_plan(
     direct_plan: QueryPlan,
     context_plan: ContextPlan,
 ) -> QueryPlan:
-    """Validate the two model outputs together at one deterministic boundary."""
+    """Normalize safe scope fallbacks, then validate both model outputs."""
+    context_requests: list[dict[str, object]] = []
+    for request in context_plan.context_requests:
+        scope_policy = request.scope_policy
+        has_scope_lookup = any(
+            lookup.purpose
+            in {
+                LookupPurpose.RESOLVE_RELATIONSHIP,
+                LookupPurpose.EXPAND_CANDIDATES,
+            }
+            for lookup in request.structured_lookups
+        )
+        if not has_scope_lookup:
+            if scope_policy == ContextScopePolicy.LOOKUP_ENTITIES:
+                scope_policy = ContextScopePolicy.SEMANTIC_ONLY
+            elif scope_policy == ContextScopePolicy.ANCHOR_AND_LOOKUP_TEAMS:
+                scope_policy = ContextScopePolicy.ANCHOR_TEAMS
+
+        payload = request.model_dump(mode="json")
+        payload["scope_policy"] = scope_policy.value
+        context_requests.append(payload)
+
     return QueryPlan.model_validate(
         {
             **direct_plan.model_dump(mode="json"),
-            "context_requests": [
-                request.model_dump(mode="json")
-                for request in context_plan.context_requests
-            ],
+            "context_requests": context_requests,
         }
     )
 

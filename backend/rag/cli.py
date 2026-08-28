@@ -364,6 +364,7 @@ def _print_rerank(result: RerankResult, *, include_judgments: bool) -> None:
     changed = "yes" if result.ranking_changed else "no"
     print(
         f"Reranker: {result.model} | {request_status} | "
+        f"attempts {result.attempts} | "
         f"candidates {result.candidate_count} -> {len(result.hits)} | "
         f"input tokens {result.input_tokens} "
         f"({result.cached_input_tokens} cached) | "

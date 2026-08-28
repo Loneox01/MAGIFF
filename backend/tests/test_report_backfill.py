@@ -4,8 +4,11 @@ from types import SimpleNamespace
 
 from jobs.backfill_reports import (
     BackfillCandidate,
+    BackfillDefinition,
+    BackfillProgress,
     backfill_reports,
     default_backfill_id,
+    load_or_create_backfill_definition,
 )
 from jobs.refresh_reports import RefreshResult
 
@@ -53,7 +56,49 @@ class FakeClient:
         return FakeQuery(self.runs)
 
 
-def candidates(_client, _season, _scoring, _league, _limit):
+class DefinitionQuery:
+    def __init__(self, rows):
+        self.rows = rows
+        self.filters = []
+        self.inserted = None
+
+    def select(self, _columns):
+        return self
+
+    def eq(self, field, value):
+        self.filters.append((field, value))
+        return self
+
+    def limit(self, _value):
+        return self
+
+    def insert(self, value):
+        self.inserted = value
+        return self
+
+    def execute(self):
+        if self.inserted is not None:
+            self.rows.append(self.inserted)
+            return SimpleNamespace(data=[self.inserted])
+        rows = [
+            row
+            for row in self.rows
+            if all(row.get(field) == value for field, value in self.filters)
+        ]
+        return SimpleNamespace(data=rows)
+
+
+class DefinitionClient:
+    def __init__(self):
+        self.rows = []
+
+    def table(self, name):
+        if name != "report_backfills":
+            raise AssertionError(f"Unexpected table: {name}")
+        return DefinitionQuery(self.rows)
+
+
+def candidates(_client, _season, _scoring, _league, _limit, _ecr_snapshot_date):
     return [
         BackfillCandidate("101", "player-1", "First Player", "current_ecr"),
         BackfillCandidate("102", "player-2", "Second Player", "current_ecr"),
@@ -64,6 +109,22 @@ def candidates(_client, _season, _scoring, _league, _limit):
             "prior_season_production",
         ),
     ]
+
+
+def definition_loader(
+    _client,
+    *,
+    requested_ecr_snapshot_date,
+    candidate_loader,
+    **_kwargs,
+):
+    pinned = requested_ecr_snapshot_date or date(2026, 8, 14)
+    return BackfillDefinition(
+        ecr_snapshot_date=pinned,
+        candidates=tuple(
+            candidate_loader(None, 2026, "ppr", "redraft_1qb", 300, pinned)
+        ),
+    )
 
 
 def refresh_result(*, status="succeeded", reason=None, new_reports=3):
@@ -94,6 +155,53 @@ def refresh_result(*, status="succeeded", reason=None, new_reports=3):
 
 
 class ReportBackfillTests(unittest.TestCase):
+    def test_definition_materializes_and_recovers_the_same_candidate_queue(self):
+        client = DefinitionClient()
+        progress = BackfillProgress(0, 0, frozenset(), None)
+        first = load_or_create_backfill_definition(
+            client,
+            backfill_id="test-backfill",
+            season=2026,
+            scoring_format="ppr",
+            league_format="redraft_1qb",
+            candidate_limit=300,
+            requested_ecr_snapshot_date=date(2026, 8, 14),
+            progress=progress,
+            candidate_loader=candidates,
+        )
+        self.assertEqual(first.ecr_snapshot_date, date(2026, 8, 14))
+        self.assertEqual(first.candidates[0].fantasypros_id, "101")
+
+        recovered = load_or_create_backfill_definition(
+            client,
+            backfill_id="test-backfill",
+            season=2026,
+            scoring_format="ppr",
+            league_format="redraft_1qb",
+            candidate_limit=300,
+            requested_ecr_snapshot_date=None,
+            progress=progress,
+            candidate_loader=lambda *_args: self.fail(
+                "A stored backfill must not rebuild its candidate queue"
+            ),
+        )
+        self.assertEqual(recovered, first)
+
+    def test_legacy_progress_requires_an_explicit_initial_pin(self):
+        progress = BackfillProgress(5, 0, frozenset({"101"}), None)
+        with self.assertRaisesRegex(RuntimeError, "no durable ECR pin"):
+            load_or_create_backfill_definition(
+                DefinitionClient(),
+                backfill_id="legacy-backfill",
+                season=2026,
+                scoring_format="ppr",
+                league_format="redraft_1qb",
+                candidate_limit=300,
+                requested_ecr_snapshot_date=None,
+                progress=progress,
+                candidate_loader=candidates,
+            )
+
     def test_plan_resumes_after_successful_player_feed(self):
         cutoff = date(2026, 1, 1)
         backfill_id = default_backfill_id(cutoff)
@@ -118,12 +226,15 @@ class ReportBackfillTests(unittest.TestCase):
             cutoff_from=cutoff,
             cutoff_to=date(2026, 8, 22),
             max_requests=2,
+            ecr_snapshot_date=date(2026, 8, 14),
             plan_only=True,
             client=client,
             candidate_loader=candidates,
+            definition_loader=definition_loader,
         )
 
         self.assertEqual(result.status, "planned")
+        self.assertEqual(result.ecr_snapshot_date, "2026-08-14")
         self.assertEqual(result.new_reports_before_run, 5)
         self.assertEqual(
             [row["fantasypros_id"] for row in result.processed_players],
@@ -143,9 +254,11 @@ class ReportBackfillTests(unittest.TestCase):
             cutoff_to=date(2026, 8, 22),
             target_new_reports=20,
             max_requests=2,
+            ecr_snapshot_date=date(2026, 8, 14),
             request_delay_seconds=0,
             client=FakeClient(),
             candidate_loader=candidates,
+            definition_loader=definition_loader,
             refresh_function=fake_refresh,
         )
 
@@ -164,9 +277,11 @@ class ReportBackfillTests(unittest.TestCase):
             cutoff_from=date(2026, 1, 1),
             cutoff_to=date(2026, 8, 22),
             max_requests=2,
+            ecr_snapshot_date=date(2026, 8, 14),
             request_delay_seconds=0,
             client=FakeClient(),
             candidate_loader=candidates,
+            definition_loader=definition_loader,
             refresh_function=lambda **_kwargs: refresh_result(
                 status="skipped",
                 reason="daily_budget_exhausted",

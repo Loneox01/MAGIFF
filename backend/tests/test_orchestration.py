@@ -142,6 +142,7 @@ class OrchestrationTests(unittest.TestCase):
         )
         names = tool_names_for_route(mixed)
         self.assertIn("rank_players_by_formula", names)
+        self.assertIn("get_player_ecr", names)
         self.assertIn("rank_players_by_ecr", names)
         self.assertNotIn("rank_teams_by_formula", names)
         self.assertNotIn("search_reports", names)

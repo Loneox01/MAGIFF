@@ -1,8 +1,33 @@
 """Interactive terminal adapter for the shared fantasy agent service."""
 
-import time
+from __future__ import annotations
 
-from services.agent import AgentRunResult, AgentService, ToolCallTelemetry
+import argparse
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from openai import OpenAI
+
+from model_costs import estimate_text_token_cost_usd
+from prompts import WEB_ONLY_BENCHMARK_INSTRUCTIONS
+from services.agent import (
+    DEFAULT_AGENT_MODEL,
+    AgentRunResult,
+    AgentService,
+    TokenUsage,
+    ToolCallTelemetry,
+)
+
+
+@dataclass(frozen=True)
+class WebOnlyRunResult:
+    answer: str
+    model: str
+    latency_seconds: float
+    usage: TokenUsage
+    estimated_cost_usd: float | None
+    web_search_calls: int
 
 
 def _print_route(result: AgentRunResult) -> None:
@@ -79,8 +104,84 @@ def run_agent(prompt: str) -> AgentRunResult:
     return _service.run(prompt)
 
 
+def run_web_only(
+    prompt: str,
+    *,
+    client: Any | None = None,
+    model: str = DEFAULT_AGENT_MODEL,
+) -> WebOnlyRunResult:
+    """Run the temporary benchmark baseline with only hosted web search."""
+    normalized_prompt = prompt.strip()
+    if not normalized_prompt:
+        raise ValueError("Web-only prompt must not be empty")
+
+    started_at = time.perf_counter()
+    response = (client or OpenAI()).responses.create(
+        model=model,
+        instructions=WEB_ONLY_BENCHMARK_INSTRUCTIONS,
+        tools=[{"type": "web_search"}],
+        input=normalized_prompt,
+    )
+    latency_seconds = time.perf_counter() - started_at
+
+    raw_usage = getattr(response, "usage", None)
+    input_tokens = int(getattr(raw_usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(raw_usage, "output_tokens", 0) or 0)
+    input_details = getattr(raw_usage, "input_tokens_details", None)
+    cached_input_tokens = min(
+        input_tokens,
+        int(getattr(input_details, "cached_tokens", 0) or 0),
+    )
+    usage = TokenUsage(
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+    )
+    return WebOnlyRunResult(
+        answer=str(getattr(response, "output_text", "") or ""),
+        model=model,
+        latency_seconds=latency_seconds,
+        usage=usage,
+        estimated_cost_usd=estimate_text_token_cost_usd(
+            model=model,
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+        ),
+        web_search_calls=sum(
+            getattr(item, "type", None) == "web_search_call"
+            for item in (getattr(response, "output", None) or [])
+        ),
+    )
+
+
+def _print_usage(result: AgentRunResult | WebOnlyRunResult) -> None:
+    print(f"\nTotal latency: {result.latency_seconds:.2f}s")
+    print(
+        f"Tokens: {result.usage.input_tokens:,} input "
+        f"({result.usage.cached_input_tokens:,} cached), "
+        f"{result.usage.output_tokens:,} output"
+    )
+    if result.estimated_cost_usd is None:
+        print("Estimated text-token cost: unavailable for configured model")
+    else:
+        print(f"Estimated text-token cost: ${result.estimated_cost_usd:.6f}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the MAGIFF terminal agent")
+    parser.add_argument(
+        "--web-only",
+        action="store_true",
+        help="temporary benchmark mode with only OpenAI web search enabled",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    print("Fantasy agent ready. Type 'exit' to quit.\n")
+    args = _parse_args()
+    mode = "web-search-only baseline" if args.web_only else "MAGIFF"
+    print(f"Fantasy agent ready ({mode}). Type 'exit' to quit.\n")
 
     while True:
         try:
@@ -93,22 +194,23 @@ def main() -> None:
         if not prompt:
             continue
 
-        started_at = time.perf_counter()
         try:
-            result = run_agent(prompt)
+            result = run_web_only(prompt) if args.web_only else run_agent(prompt)
         except Exception as error:
             print(f"\nError: {error}\n")
             continue
 
-        _print_route(result)
-        for call in result.tool_calls:
-            _print_tool(call)
-        elapsed = time.perf_counter() - started_at
+        if isinstance(result, WebOnlyRunResult):
+            print(
+                f"\nMode: web search only | {result.model} | "
+                f"web searches {result.web_search_calls}"
+            )
+        else:
+            _print_route(result)
+            for call in result.tool_calls:
+                _print_tool(call)
         print(f"\nAgent: {result.answer}")
-        print(f"\nLatency: {elapsed:.2f}s")
-        print(f"Input tokens: {result.usage.input_tokens}")
-        print(f"Cached input tokens: {result.usage.cached_input_tokens}")
-        print(f"Output tokens: {result.usage.output_tokens}")
+        _print_usage(result)
         print()
 
 
