@@ -503,6 +503,29 @@ def get_player_names(player_ids: list[str]) -> dict[str, str]:
     return {row["player_id"]: row["display_name"] for row in rows}
 
 
+def get_player_external_ids(
+    player_ids: list[str],
+    provider: str,
+) -> dict[str, str]:
+    """Return one provider identifier for each requested internal player ID."""
+    if not player_ids:
+        return {}
+    rows = (
+        get_supabase_client()
+        .table("player_external_ids")
+        .select("player_id,external_id")
+        .eq("provider", provider)
+        .in_("player_id", list(dict.fromkeys(player_ids)))
+        .execute()
+        .data
+    )
+    return {
+        str(row["player_id"]): str(row["external_id"])
+        for row in rows
+        if row.get("player_id") and row.get("external_id")
+    }
+
+
 def _get_ecr_snapshot_date(
     client,
     season: int,

@@ -4,6 +4,17 @@ This directory adapts MAGIFF's services to external clients. Keep client
 formatting and transport behavior here; deterministic query and resolution
 logic belongs in `services/`.
 
+`sleeper.py` contains public, read-only draft and in-season league adapters.
+The league adapter retrieves members, rosters, matchups, transactions, NFL
+state, and trending adds/drops for the deterministic league context. Neither
+adapter authenticates a Sleeper user or mutates a roster.
+
+`fantasycalc.py` is a best-effort, read-only adapter for current FantasyCalc
+redraft market values. The waiver advisor configures the request from the live
+league's team count, quarterback format, and PPR scoring, then joins players by
+Sleeper ID. FantasyCalc's endpoint is public but undocumented, so failures are
+surfaced as missing market evidence rather than interpreted as zero value.
+
 ## Discord commands
 
 Discord slash-command parameters are separate form fields presented by Discord.

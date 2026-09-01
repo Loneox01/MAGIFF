@@ -156,6 +156,35 @@ class ReportRefreshTests(unittest.TestCase):
         self.assertTrue(diff.possible_coverage_gap)
         self.assertEqual(diff.oldest_published_at, "2026-08-21T14:52:01+00:00")
 
+    def test_classify_feed_flags_an_all_new_provider_capped_window(self) -> None:
+        items = [report_item(index) for index in range(1, 11)]
+        diff = classify_feed(
+            {"count": 10, "items": items},
+            {},
+            requested_limit=20,
+            source_received=10,
+        )
+
+        self.assertEqual(diff.received, 10)
+        self.assertEqual(len(diff.new_items), 10)
+        self.assertTrue(diff.feed_window_saturated)
+        self.assertTrue(diff.possible_coverage_gap)
+
+    def test_classify_feed_accepts_an_underfilled_window_with_overlap(self) -> None:
+        old = report_item(1)
+        new = report_item(2)
+        diff = classify_feed(
+            {"count": 2, "items": [new, old]},
+            {"1": content_hash(old)},
+            requested_limit=20,
+            source_received=2,
+        )
+
+        self.assertEqual(len(diff.new_items), 1)
+        self.assertEqual(len(diff.unchanged_items), 1)
+        self.assertFalse(diff.feed_window_saturated)
+        self.assertFalse(diff.possible_coverage_gap)
+
     def test_unchanged_refresh_skips_model_and_embedding_work(self) -> None:
         item = report_item(603602)
         client = FakeClient(

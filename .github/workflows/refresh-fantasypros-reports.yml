@@ -2,9 +2,11 @@ name: Refresh FantasyPros reports
 
 on:
   schedule:
-    # 24 provider requests/day at most; the application ledger independently
-    # enforces a 40/day budget below FantasyPros' 50/day limit.
-    - cron: "17 * * * *"
+    # Poll every 40 minutes (36 requests/day). This leaves four requests below
+    # the application ledger's 40/day budget and fourteen below FantasyPros'
+    # 50/day provider limit. GitHub may still delay scheduled starts.
+    - cron: "7,47 */2 * * *"
+    - cron: "27 1-23/2 * * *"
   workflow_dispatch:
     inputs:
       report_limit:

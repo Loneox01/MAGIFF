@@ -10,6 +10,25 @@ The backend has four independent entry points:
   profiles. The test guild gets `/ask`, `/news`, `/stats`, and `/game`; UAI gets
   `/news`, `/stats`, and `/game`.
 
+The read-only draft advisor is intentionally separate from the general agent.
+Use `python -m drafting.cli simulate ...` for a reproducible local mock or
+`python -m drafting.cli live ...` for one public Sleeper draft snapshot. See
+[`drafting/README.md`](drafting/README.md).
+
+After the draft, `python -m league_management.cli ...` builds a deterministic,
+read-only Sleeper league snapshot for future waiver, lineup, trade, and
+news-response policies. It verifies the managed roster by Sleeper user ID and
+joins public league state to MAGIFF player identities and current ECR without
+invoking an LLM. See
+[`league_management/README.md`](league_management/README.md).
+
+`python -m waivers.cli --context-only` inspects the compact default waiver
+packet without spending model tokens. Running `python -m waivers.cli "..."`
+starts the separate read-only waiver advisor, which searches bounded available-
+player slices, verifies latest news for every proposed add and drop, and returns
+a structured recommendation without executing it. See
+[`waivers/README.md`](waivers/README.md).
+
 ## Local API
 
 Install dependencies from `backend/`, then start one Uvicorn worker:

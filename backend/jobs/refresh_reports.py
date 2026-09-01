@@ -213,11 +213,17 @@ def classify_feed(
     provider_received = (
         len(raw_items) if source_received is None else source_received
     )
-    saturated = provider_received >= requested_limit
-    # If every item in a full provider window is unseen/changed, more new items
-    # may sit beyond the page boundary. Telemetry flags this rather than making
-    # an unbudgeted pagination request.
-    possible_gap = saturated and bool(valid) and not unchanged_items
+    # Some FantasyPros API plans silently return a smaller window than the
+    # requested limit. A descending feed only proves continuity when at least
+    # one returned external ID was already stored. If the entire observable
+    # window is new, treat it as exhausted even when its row count is below the
+    # requested limit; older unseen reports may already have fallen behind it.
+    has_stored_overlap = bool(changed_items or unchanged_items)
+    observable_window_exhausted = bool(valid) and not has_stored_overlap
+    saturated = (
+        provider_received >= requested_limit or observable_window_exhausted
+    )
+    possible_gap = observable_window_exhausted
     return FeedDiff(
         received=provider_received,
         eligible=len(raw_items),

@@ -107,6 +107,8 @@ function MarkdownAnswer({ content }: { content: string }) {
 
 function ResponseMeta({ response }: { response: AgentQueryResponse }) {
     const toolCount = response.tool_calls.length;
+    const webSearchCalls = response.web_search_calls ?? 0;
+    const evidenceCalls = toolCount + webSearchCalls;
     const totalTokens = response.usage.input_tokens + response.usage.output_tokens;
     const cost = response.estimated_cost_usd;
 
@@ -114,7 +116,10 @@ function ResponseMeta({ response }: { response: AgentQueryResponse }) {
         <div className="response-meta" aria-label="Response details">
             <span>{response.model.replace("gpt-5.6-", "")}</span>
             <span>{response.latency_seconds.toFixed(1)}s</span>
-            <span>{toolCount} {toolCount === 1 ? "tool" : "tools"}</span>
+            <span>
+                {evidenceCalls} {evidenceCalls === 1 ? "tool" : "tools"}
+                {webSearchCalls > 0 ? ` (${webSearchCalls} web)` : ""}
+            </span>
             <span>{totalTokens.toLocaleString()} tokens</span>
             {cost != null && <span>${cost.toFixed(4)}</span>}
         </div>

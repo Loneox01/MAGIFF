@@ -20,6 +20,8 @@ export type AgentQueryResponse = {
         error: string | null;
     }>;
     estimated_cost_usd: number | null;
+    web_search_calls: number;
+    web_sources: Array<{ title: string; url: string }>;
 };
 
 export class AgentApiError extends Error {
