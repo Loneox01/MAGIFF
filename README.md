@@ -84,6 +84,4 @@ configuration.
 ## Safety and data
 
 Secrets, raw provider data, processed datasets, and local retrieval caches are
-excluded from Git. Sleeper integrations use public read-only data; draft,
-waiver, and lineup workflows generate validated recommendations but do not
-submit roster mutations.
+excluded from Git. 
