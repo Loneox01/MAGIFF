@@ -1,6 +1,7 @@
 # Secrets and local environment overrides
 .env
 .env.*
+!.env.example
 *.local
 env
 env.*

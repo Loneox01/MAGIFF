@@ -14,8 +14,8 @@ Run a live read from `backend/`:
 
 ```bash
 python -m league_management.cli \
-  --league-id 1395852201481486336 \
-  --user Magiff
+  --league-id YOUR_SLEEPER_LEAGUE_ID \
+  --user YOUR_SLEEPER_USERNAME
 ```
 
 Use `--json` for the complete provider-neutral snapshot or `--agent-json` for

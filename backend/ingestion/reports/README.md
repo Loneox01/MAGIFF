@@ -51,10 +51,9 @@ for **20 reports**. It then:
 6. records counts, model tokens, embedding work, publication coverage, status,
    and any error in `report_ingestion_runs`.
 
-The GitHub Actions workflow runs at minute 17 of every hour: normally **24 API
-requests/day**, comfortably below both the application's **40 per rolling 24
-hours budget** and
-the provider's stated **50/day limit**. Manual workflow runs share the same
+The GitHub Actions workflow polls every 40 minutes: normally **36 API
+requests/day**, below both the application's **40 per rolling 24 hours budget**
+and the provider's stated **50/day limit**. Manual workflow runs share the same
 database budget, so they cannot silently exceed it. Provider requests are not
 automatically retried because each attempt may consume quota.
 

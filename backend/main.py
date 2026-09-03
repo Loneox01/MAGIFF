@@ -110,7 +110,7 @@ def run_web_only(
     client: Any | None = None,
     model: str = DEFAULT_AGENT_MODEL,
 ) -> WebOnlyRunResult:
-    """Run the temporary benchmark baseline with only hosted web search."""
+    """Run the benchmark baseline with only hosted web search."""
     normalized_prompt = prompt.strip()
     if not normalized_prompt:
         raise ValueError("Web-only prompt must not be empty")
@@ -173,7 +173,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--web-only",
         action="store_true",
-        help="temporary benchmark mode with only OpenAI web search enabled",
+        help="benchmark mode with only OpenAI web search enabled",
     )
     return parser.parse_args()
 

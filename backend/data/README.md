@@ -72,7 +72,7 @@ processed/
 - `seasons/` contains normalized historical tables partitioned by season.
 - `reports/` contains database-ready normalized report documents, the latest
   metadata-processing run summary, and the rebuildable local keyword/vector
-  retrieval index. Its ignored `evaluation_logs/` directory contains temporary
-  local baselines that should be removed after they become durable fixtures.
+  retrieval index. Its ignored `evaluation_logs/` directory contains local
+  benchmark output.
 - `orchestration/` contains the rebuildable request-route cache and telemetry.
 - `manifest.json` records processing times, output shapes, and unmatched rows.

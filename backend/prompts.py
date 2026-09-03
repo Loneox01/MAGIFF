@@ -6,7 +6,7 @@ Prompt locations:
   ``drafting/agent.py``.
 - WAIVER_AGENT_INSTRUCTIONS and WAIVER_FINALIZATION_INSTRUCTIONS: dedicated
   read-only waiver advisor in ``waivers/agent.py``.
-- WEB_ONLY_BENCHMARK_INSTRUCTIONS: temporary CLI comparison mode in
+- WEB_ONLY_BENCHMARK_INSTRUCTIONS: CLI comparison baseline in
   ``main.py``.
 - REQUEST_ROUTER_INSTRUCTIONS: capability router in ``orchestration/router.py``.
 - DIRECT_REPORT_PLANNER_INSTRUCTIONS: direct report query planner in

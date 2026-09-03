@@ -38,8 +38,8 @@ class SupabaseRAGStore(LocalRAGStore):
     ) -> None:
         self.client = client or get_supabase_client()
         self.embedder = embedder
-        # Planner, identity, and reranker caches remain local for now. Keeping
-        # this attribute maintains the pipeline's existing cache contract.
+        # Planner, identity, and reranker caches are process-local. Keeping this
+        # attribute maintains the pipeline's existing cache contract.
         self.index_path = Path(cache_path)
         self._query_embeddings: dict[tuple[str, str], list[float]] = {}
 
