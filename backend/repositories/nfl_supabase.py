@@ -18,6 +18,7 @@ GAME_FIELDS = [
     "game_type",
     "week",
     "gameday",
+    "gametime",
     "away_team",
     "away_score",
     "home_team",
@@ -175,6 +176,21 @@ def get_team_games(team: str, season: int, week: int | None) -> list[dict]:
         query = query.eq("week", week)
 
     return query.order("gameday").execute().data
+
+
+def get_week_games(season: int, week: int) -> list[dict]:
+    """Return one NFL week's schedule with exact stored game times."""
+    return (
+        get_supabase_client()
+        .table("games")
+        .select(",".join(GAME_FIELDS))
+        .eq("season", season)
+        .eq("week", week)
+        .order("gameday")
+        .order("gametime")
+        .execute()
+        .data
+    )
 
 
 def get_player_season_stats(

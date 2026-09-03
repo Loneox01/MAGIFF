@@ -15,6 +15,20 @@ league's team count, quarterback format, and PPR scoring, then joins players by
 Sleeper ID. FantasyCalc's endpoint is public but undocumented, so failures are
 surfaced as missing market evidence rather than interpreted as zero value.
 
+`sleeper_projections.py` isolates Sleeper's undocumented, read-only weekly NFL
+projection feed. The waiver and lineup layers join projections by Sleeper player
+ID and calculate points from projected stat components using each league's own
+scoring settings. The lineup layer also preserves the payload's live injury
+designation, body part, notes, injury start date, and news timestamp. Because the
+endpoint is not part of Sleeper's documented API, failures are treated as
+missing projection/health evidence and must not block the underlying league
+context.
+
+`discord.py` contains both interaction-webhook delivery and a narrowly scoped
+bot client for proactive channel messages. `discord_lineups.py` formats one
+bounded message per exact kickoff slate and enables an explicit owner mention
+only for change, failure, and emergency outcomes.
+
 ## Discord commands
 
 Discord slash-command parameters are separate form fields presented by Discord.

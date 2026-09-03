@@ -1,6 +1,6 @@
 # MAGIFF backend
 
-The backend has four independent entry points:
+The backend has several independent entry points:
 
 - `python main.py` runs the interactive terminal agent.
 - `uvicorn api.app:app --reload` runs the HTTP agent API.
@@ -9,6 +9,9 @@ The backend has four independent entry points:
 - `python -m jobs.register_discord_commands` registers private Discord command
   profiles. The test guild gets `/ask`, `/news`, `/stats`, and `/game`; UAI gets
   `/news`, `/stats`, and `/game`.
+- `python -m jobs.review_lineup --plan` previews exact roster kickoff slates;
+  the scheduled form performs one automatic T-75 lineup review per slate, and
+  `--e2e-next` forces a complete next-slate deployment test.
 
 The read-only draft advisor is intentionally separate from the general agent.
 Use `python -m drafting.cli simulate ...` for a reproducible local mock or
@@ -28,6 +31,16 @@ starts the separate read-only waiver advisor, which searches bounded available-
 player slices, verifies latest news for every proposed add and drop, and returns
 a structured recommendation without executing it. See
 [`waivers/README.md`](waivers/README.md).
+
+`python -m lineups.cli --context-only` inspects the verified weekly roster,
+league-scored projections, health designations, and deterministic legal
+projection baseline without spending model tokens. Running
+`python -m lineups.cli "..."` starts the separate read-only lineup advisor,
+which verifies current news for changed, close, and injury-designated players
+before returning a code-validated structured lineup. The automatic review job
+stores an idempotent audit row and posts one grouped slate message to Discord;
+it recommends changes but cannot submit them through Sleeper. See
+[`lineups/README.md`](lineups/README.md).
 
 ## Local API
 
@@ -131,8 +144,9 @@ DISCORD_UAI_GUILD_ID=the-friends-server-id
 DISCORD_UAI_ENABLED=true
 ```
 
-Keep the bot token only in the project-root local `.env`; it is needed for
-command registration but not by the running interaction endpoint:
+Keep the bot token in the project-root local `.env` for command registration.
+The interaction endpoint does not need it, but the lineup-review GitHub Action
+does, so add the same value as a repository Actions secret:
 
 ```text
 DISCORD_BOT_TOKEN=the-private-bot-token

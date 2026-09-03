@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -209,6 +210,53 @@ class DiscordWebhookClient:
         )
         response.raise_for_status()
 
+
+class DiscordBotClient:
+    """Send proactive messages to one Discord channel as the bot user."""
+
+    def __init__(
+        self,
+        bot_token: str,
+        *,
+        client: httpx.Client | None = None,
+        timeout_seconds: float = 20,
+    ) -> None:
+        normalized = bot_token.strip()
+        if not normalized:
+            raise ValueError("DISCORD_BOT_TOKEN must not be empty")
+        self.bot_token = normalized
+        self.client = client or httpx.Client(timeout=timeout_seconds)
+
+    def send_channel_message(self, *, channel_id: str, content: str) -> str:
+        normalized_channel = channel_id.strip()
+        if not normalized_channel.isdigit():
+            raise ValueError("Discord channel ID must be numeric")
+        normalized_content = content.strip()
+        if not normalized_content or len(normalized_content) > DISCORD_MESSAGE_LIMIT:
+            raise ValueError("Discord message must contain 1-2000 characters")
+        mentioned_users = list(
+            dict.fromkeys(
+                re.findall(r"<@(\d+)>", normalized_content)
+            )
+        )
+        response = self.client.post(
+            f"{DISCORD_API_BASE}/channels/{normalized_channel}/messages",
+            headers={"Authorization": f"Bot {self.bot_token}"},
+            json={
+                "content": normalized_content,
+                "flags": SUPPRESS_EMBEDS_MESSAGE_FLAG,
+                "allowed_mentions": {
+                    "parse": [],
+                    "users": mentioned_users,
+                    "replied_user": False,
+                },
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not payload.get("id"):
+            raise RuntimeError("Discord did not return a message ID")
+        return str(payload["id"])
 
 @dataclass(frozen=True)
 class DiscordCompletion:

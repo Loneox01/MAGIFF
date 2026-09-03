@@ -1,0 +1,58 @@
+name: Review Sleeper lineup
+
+on:
+  schedule:
+    # The job is cheap until a roster slate reaches T-75. A 15-minute poll
+    # places the actual review approximately 60-75 minutes before kickoff even
+    # when the exact NFL kickoff minute varies.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      e2e_next:
+        description: Force a complete review of the next upcoming roster slate
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sleeper-lineup-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_LINEUP_MODEL: gpt-5.6-terra
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+      RAG_REPORT_STORE: supabase
+      SLEEPER_LEAGUE_ID: ${{ secrets.SLEEPER_LEAGUE_ID }}
+      SLEEPER_USERNAME: ${{ secrets.SLEEPER_USERNAME }}
+      DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+      DISCORD_LINEUP_CHANNEL_ID: ${{ secrets.DISCORD_LINEUP_CHANNEL_ID }}
+      DISCORD_OWNER_USER_ID: ${{ secrets.DISCORD_OWNER_USER_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Review next lineup deadline
+        run: >-
+          python -m jobs.review_lineup
+          ${{ inputs.e2e_next && '--e2e-next' || '' }}

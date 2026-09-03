@@ -401,6 +401,7 @@ class LeagueContextBuilder:
         trending_lookback_hours: int = 24,
         trending_limit: int = 25,
         ecr_as_of_date: str | None = None,
+        include_market: bool = True,
     ) -> LeagueContext:
         if not 10 <= available_limit <= 100:
             raise ValueError("available_limit must be between 10 and 100")
@@ -449,22 +450,29 @@ class LeagueContextBuilder:
         external_ids = _external_ids(snapshot)
 
         market_error = None
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=2 if include_market else 1) as executor:
             profiles_future = executor.submit(
                 self.players.resolve_players,
                 external_ids,
             )
-            market_future = executor.submit(
-                self.market.load_candidates,
-                season=season,
-                scoring_format=ecr_scoring,
-                league_format=ecr_league,
-                snapshot_type="current",
-                as_of_date=ecr_as_of_date,
+            market_future = (
+                executor.submit(
+                    self.market.load_candidates,
+                    season=season,
+                    scoring_format=ecr_scoring,
+                    league_format=ecr_league,
+                    snapshot_type="current",
+                    as_of_date=ecr_as_of_date,
+                )
+                if include_market
+                else None
             )
             profiles = profiles_future.result()
             try:
-                selected_date, market, source, ranking_page = market_future.result()
+                if market_future is None:
+                    selected_date, market, source, ranking_page = None, [], None, None
+                else:
+                    selected_date, market, source, ranking_page = market_future.result()
             except RuntimeError as error:
                 selected_date, market, source, ranking_page = None, [], None, None
                 market_error = str(error)

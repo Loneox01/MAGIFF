@@ -10,7 +10,11 @@ from fastapi.testclient import TestClient
 
 from api.app import create_app
 from api.config import ApiSettings
-from integrations.discord import RecentInteractionIds, split_discord_message
+from integrations.discord import (
+    DiscordBotClient,
+    RecentInteractionIds,
+    split_discord_message,
+)
 from integrations.discord_news import (
     DiscordNewsRunner,
     NewsCompletion,
@@ -298,6 +302,37 @@ class DiscordTests(unittest.TestCase):
         self.assertEqual(unsigned.status_code, 401)
         self.assertEqual(invalid.status_code, 401)
         self.assertEqual(self.agent.prompts, [])
+
+    def test_bot_client_sends_one_message_and_only_allows_explicit_user_ping(self):
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"id": "discord-message-1"})
+
+        bot = DiscordBotClient(
+            "private-token",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        message_id = bot.send_channel_message(
+            channel_id="123456789012345678",
+            content="<@222222222222222222>\n## REVIEW FAILED\nTry again.",
+        )
+
+        self.assertEqual(message_id, "discord-message-1")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(
+            requests[0].headers["Authorization"],
+            "Bot private-token",
+        )
+        payload = json.loads(requests[0].content)
+        self.assertEqual(payload["allowed_mentions"]["parse"], [])
+        self.assertEqual(
+            payload["allowed_mentions"]["users"],
+            ["222222222222222222"],
+        )
+        self.assertEqual(payload["flags"], 4)
 
     def test_responds_to_discord_ping(self) -> None:
         response = self.signed_post(

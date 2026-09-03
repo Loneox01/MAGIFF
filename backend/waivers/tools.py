@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
+from integrations.sleeper_projections import (
+    SleeperProjectionClient,
+    SleeperWeeklyProjection,
+)
 from rag.planning.schema_values import TeamCode
 from repositories.league_supabase import SupabaseWaiverPlayerRepository
 from services.news import NewsDetail, NewsOutcome, NewsQuery, NewsService
@@ -15,7 +21,12 @@ from .models import WaiverCandidate, WaiverContext
 
 
 WAIVER_POSITIONS = ["QB", "RB", "WR", "TE", "K", "DEF"]
-WAIVER_SORTS = ["fantasycalc_value", "fantasycalc_trend_30_day", "ecr"]
+WAIVER_SORTS = [
+    "fantasycalc_value",
+    "fantasycalc_trend_30_day",
+    "ecr",
+    "sleeper_projection",
+]
 CURRENT_TEAM_CODES = [
     value.value
     for value in TeamCode
@@ -56,7 +67,10 @@ RANK_AVAILABLE_PLAYERS_TOOL = {
             "sort_by": {
                 "type": "string",
                 "enum": WAIVER_SORTS,
-                "description": "Market value, 30-day market trend, or ECR.",
+                "description": (
+                    "Market value, 30-day market trend, ECR, or the selected "
+                    "week's league-scoring-adjusted Sleeper projection."
+                ),
             },
             "limit": {
                 "type": "integer",
@@ -123,6 +137,54 @@ GET_RECENT_WAIVER_NEWS_TOOL = {
     "strict": True,
 }
 
+GET_PLAYER_WEEK_OUTLOOK_TOOL = {
+    "type": "function",
+    "name": "get_player_week_outlook",
+    "description": (
+        "Return a managed or available player's Sleeper projection, opponent, "
+        "and game date for one week using this league's scoring settings. "
+        "Projections are estimates and do not establish health or role."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "player_ref": {
+                "type": "string",
+                "description": "Exact or unambiguous player name.",
+            },
+            "week": {"type": "integer", "minimum": 1, "maximum": 22},
+        },
+        "required": ["player_ref", "week"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
+RANK_STREAMING_DEFENSES_TOOL = {
+    "type": "function",
+    "name": "rank_streaming_defenses",
+    "description": (
+        "Compare this roster's current D/ST with a bounded set of available "
+        "D/ST streamers using league-scoring-adjusted Sleeper projections. "
+        "Use one week for a rental or up to three for a possible short hold."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "week": {"type": "integer", "minimum": 1, "maximum": 22},
+            "lookahead_weeks": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3,
+            },
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+        "required": ["week", "lookahead_weeks", "limit"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
 
 def _name_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
@@ -146,18 +208,25 @@ class WaiverToolbox:
         season_stats: Callable[..., dict] = get_player_season_stats,
         depth_chart: Callable[..., list[dict]] = get_team_depth_chart,
         player_search: Any | None = None,
+        projections: Any | None = None,
     ) -> None:
         self.context = context
         self.news = news or NewsService()
         self.season_stats = season_stats
         self.depth_chart = depth_chart
         self.player_search = player_search or SupabaseWaiverPlayerRepository()
+        self.projections = projections or SleeperProjectionClient()
+        self._projection_cache: dict[
+            tuple[int, str], tuple[SleeperWeeklyProjection, ...]
+        ] = {}
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
         return [
             RANK_AVAILABLE_PLAYERS_TOOL,
             GET_AVAILABLE_PLAYER_TOOL,
+            GET_PLAYER_WEEK_OUTLOOK_TOOL,
+            RANK_STREAMING_DEFENSES_TOOL,
             GET_RECENT_WAIVER_NEWS_TOOL,
         ]
 
@@ -166,6 +235,8 @@ class WaiverToolbox:
         return {
             "rank_available_players": self.rank_available_players,
             "get_available_player": self.get_available_player,
+            "get_player_week_outlook": self.get_player_week_outlook,
+            "rank_streaming_defenses": self.rank_streaming_defenses,
             "get_recent_news": self.get_recent_news,
         }
 
@@ -221,11 +292,21 @@ class WaiverToolbox:
                     item.display_name,
                 )
             )
-        else:
+        elif sort_by == "ecr":
             values.sort(
                 key=lambda item: (
                     item.ecr is None,
                     item.ecr if item.ecr is not None else float("inf"),
+                    -(item.fantasycalc_value or 0),
+                    item.display_name,
+                )
+            )
+        else:
+            values.sort(
+                key=lambda item: (
+                    item.projection_week != self.context.league.current_week,
+                    item.projected_points is None,
+                    -(item.projected_points or 0),
                     -(item.fantasycalc_value or 0),
                     item.display_name,
                 )
@@ -274,6 +355,12 @@ class WaiverToolbox:
             trade_frequency=None,
             ecr=None,
             ecr_position_rank=None,
+            projection_week=None,
+            projected_points=None,
+            projection_opponent=None,
+            projection_game_date=None,
+            projection_updated_at=None,
+            projection_source=None,
         )
 
     def _resolve_available(
@@ -367,6 +454,303 @@ class WaiverToolbox:
             "current_depth_chart_entries": depth_context,
             "warnings": errors,
         }
+
+    def _all_context_candidates(self) -> tuple[WaiverCandidate, ...]:
+        return (*self.context.available_players, *self.context.managed_players)
+
+    def _resolve_context_player(
+        self,
+        player_ref: str,
+    ) -> tuple[WaiverCandidate | None, list[WaiverCandidate], str | None]:
+        query = player_ref.strip()
+        if not query:
+            raise ValueError("player_ref cannot be blank")
+        key = _name_key(query)
+        pool = self._all_context_candidates()
+        exact = [item for item in pool if _name_key(item.display_name) == key]
+        partial = [item for item in pool if key in _name_key(item.display_name)]
+        matches = exact or partial
+        if len(matches) != 1:
+            return None, matches[:5], None
+        player = matches[0]
+        availability = (
+            "available"
+            if any(
+                item.sleeper_player_id == player.sleeper_player_id
+                for item in self.context.available_players
+            )
+            else "managed_roster"
+        )
+        return player, [], availability
+
+    def _projection_rows(
+        self,
+        *,
+        position: str,
+        week: int,
+    ) -> tuple[SleeperWeeklyProjection, ...]:
+        key = (week, position)
+        if key not in self._projection_cache:
+            rows = self.projections.weekly_projections(
+                season=self.context.league.season,
+                week=week,
+                season_type=(
+                    "post"
+                    if self.context.league.season_type == "post"
+                    else "regular"
+                ),
+                positions=(position,),
+            )
+            self._projection_cache[key] = tuple(rows)
+        return self._projection_cache[key]
+
+    def _candidate_from_projection(
+        self,
+        projection: SleeperWeeklyProjection,
+    ) -> WaiverCandidate:
+        base = next(
+            (
+                item
+                for item in self._all_context_candidates()
+                if item.sleeper_player_id == projection.sleeper_player_id
+            ),
+            None,
+        )
+        team = (
+            {"AZ": "ARI", "LAR": "LA"}.get(projection.team, projection.team)
+            if projection.team
+            else None
+        )
+        opponent = (
+            {"AZ": "ARI", "LAR": "LA"}.get(
+                projection.opponent,
+                projection.opponent,
+            )
+            if projection.opponent
+            else None
+        )
+        if base is None:
+            base = WaiverCandidate(
+                sleeper_player_id=projection.sleeper_player_id,
+                player_id=None,
+                display_name=projection.display_name,
+                position=projection.position,
+                team=team,
+                roster_status=None,
+                fantasycalc_value=None,
+                fantasycalc_overall_rank=None,
+                fantasycalc_position_rank=None,
+                fantasycalc_trend_30_day=None,
+                roster_percent=None,
+                trade_frequency=None,
+            )
+        return replace(
+            base,
+            projection_week=projection.week,
+            projected_points=projection.projected_points(
+                self.context.league.scoring_settings
+            ),
+            projection_opponent=opponent,
+            projection_game_date=projection.game_date,
+            projection_updated_at=projection.updated_at,
+            projection_source=projection.company or "Sleeper",
+        )
+
+    def _projected_candidates(
+        self,
+        *,
+        position: str,
+        week: int,
+    ) -> list[WaiverCandidate]:
+        if week == self.context.league.current_week:
+            current = [
+                item
+                for item in self._all_context_candidates()
+                if item.position == position and item.projection_week == week
+            ]
+            if current:
+                return current
+        return [
+            self._candidate_from_projection(row)
+            for row in self._projection_rows(position=position, week=week)
+        ]
+
+    def get_player_week_outlook(
+        self,
+        player_ref: str,
+        week: int,
+    ) -> dict[str, Any]:
+        if not 1 <= week <= 22:
+            raise ValueError("week must be between 1 and 22")
+        player, candidates, availability = self._resolve_context_player(player_ref)
+        if player is None:
+            return {
+                "status": "ambiguous" if candidates else "not_found",
+                "player_ref": player_ref,
+                "candidates": [item.agent_view() for item in candidates],
+                "retry": (
+                    "Retry with one candidate's exact name."
+                    if candidates
+                    else "Use get_available_player for a deeper named free-agent search."
+                ),
+            }
+        projected = next(
+            (
+                item
+                for item in self._projected_candidates(
+                    position=player.position,
+                    week=week,
+                )
+                if item.sleeper_player_id == player.sleeper_player_id
+            ),
+            None,
+        )
+        has_points = projected is not None and projected.projected_points is not None
+        return {
+            "status": "projected" if has_points else "no_projection",
+            "availability": availability,
+            "player": (projected or player).agent_view(),
+            "projection_note": (
+                "Calculated from Sleeper projected stats using this league's scoring settings; it is an estimate, not a role or health guarantee."
+                if has_points
+                else "Sleeper returned no usable point projection for this player and week."
+            ),
+        }
+
+    def rank_streaming_defenses(
+        self,
+        week: int,
+        lookahead_weeks: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        if not 1 <= week <= 22:
+            raise ValueError("week must be between 1 and 22")
+        if not 1 <= lookahead_weeks <= 3:
+            raise ValueError("lookahead_weeks must be between 1 and 3")
+        if week + lookahead_weeks - 1 > 22:
+            raise ValueError("the requested lookahead extends past week 22")
+        if not 1 <= limit <= 10:
+            raise ValueError("limit must be between 1 and 10")
+
+        weeks = list(range(week, week + lookahead_weeks))
+        with ThreadPoolExecutor(max_workers=len(weeks)) as executor:
+            week_values = list(
+                executor.map(
+                    lambda selected: self._projected_candidates(
+                        position="DEF",
+                        week=selected,
+                    ),
+                    weeks,
+                )
+            )
+        by_week = {
+            selected_week: {
+                item.sleeper_player_id: item for item in values
+            }
+            for selected_week, values in zip(weeks, week_values, strict=True)
+        }
+        rostered = self._rostered_sleeper_ids()
+        managed_defenses = {
+            player.sleeper_player_id
+            for player in self.context.league.managed_roster.all_players
+            if player.position == "DEF"
+        }
+
+        def defense_view(defense_id: str) -> dict[str, Any]:
+            schedule = []
+            for selected_week in weeks:
+                item = by_week[selected_week].get(defense_id)
+                schedule.append(
+                    {
+                        "week": selected_week,
+                        "points": item.projected_points if item else None,
+                        "opponent": item.projection_opponent if item else None,
+                        "game_date": item.projection_game_date if item else None,
+                    }
+                )
+            available_points = [
+                value["points"]
+                for value in schedule
+                if value["points"] is not None
+            ]
+            first = next(
+                (
+                    by_week[selected_week][defense_id]
+                    for selected_week in weeks
+                    if defense_id in by_week[selected_week]
+                ),
+                None,
+            )
+            return {
+                "name": first.display_name if first else defense_id,
+                "team": first.team if first else defense_id,
+                "schedule": schedule,
+                "projected_weeks": len(available_points),
+                "lookahead_total": (
+                    round(sum(available_points), 2) if available_points else None
+                ),
+                "lookahead_average": (
+                    round(sum(available_points) / len(available_points), 2)
+                    if available_points
+                    else None
+                ),
+            }
+
+        opening = by_week[week]
+        available_ids = [
+            defense_id
+            for defense_id, item in opening.items()
+            if defense_id not in rostered and item.projected_points is not None
+        ]
+        available = [defense_view(defense_id) for defense_id in available_ids]
+        available.sort(
+            key=lambda item: (
+                item["projected_weeks"] != lookahead_weeks,
+                -(item["lookahead_average"] or 0),
+                -(item["schedule"][0]["points"] or 0),
+                item["name"],
+            )
+        )
+        current = [
+            defense_view(defense_id) for defense_id in sorted(managed_defenses)
+        ]
+        current_week_best = max(
+            (
+                item["schedule"][0]["points"]
+                for item in current
+                if item["schedule"][0]["points"] is not None
+            ),
+            default=None,
+        )
+        selected = available[:limit]
+        for item in selected:
+            first_points = item["schedule"][0]["points"]
+            item["current_week_advantage"] = (
+                round(first_points - current_week_best, 2)
+                if first_points is not None and current_week_best is not None
+                else None
+            )
+        return {
+            "season": self.context.league.season,
+            "starting_week": week,
+            "lookahead_weeks": lookahead_weeks,
+            "current_defenses": current,
+            "available_defenses": selected,
+            "projection_note": (
+                "Points are calculated from Sleeper projected stats using this league's scoring settings. Compare the gain with roster and waiver cost; projections are not guarantees."
+            ),
+        }
+
+    def news_arguments_for(self, name: str, *, limit: int = 3) -> dict[str, Any]:
+        key = _name_key(name)
+        matches = [
+            item
+            for item in self._all_context_candidates()
+            if _name_key(item.display_name) == key
+        ]
+        if len(matches) == 1 and matches[0].position == "DEF" and matches[0].team:
+            return {"player_ref": None, "team": matches[0].team, "limit": limit}
+        return {"player_ref": name, "team": None, "limit": limit}
 
     def get_recent_news(
         self,

@@ -127,6 +127,12 @@ class WaiverCandidate:
     trade_frequency: float | None
     ecr: float | None = None
     ecr_position_rank: int | None = None
+    projection_week: int | None = None
+    projected_points: float | None = None
+    projection_opponent: str | None = None
+    projection_game_date: str | None = None
+    projection_updated_at: int | None = None
+    projection_source: str | None = None
 
     def agent_view(self) -> dict[str, Any]:
         return {
@@ -144,6 +150,14 @@ class WaiverCandidate:
             },
             "ecr": self.ecr,
             "ecr_position_rank": self.ecr_position_rank,
+            "weekly_projection": {
+                "week": self.projection_week,
+                "points": self.projected_points,
+                "opponent": self.projection_opponent,
+                "game_date": self.projection_game_date,
+                "updated_at": self.projection_updated_at,
+                "source": self.projection_source,
+            },
         }
 
 
@@ -154,6 +168,7 @@ class WaiverContext:
     managed_players: tuple[WaiverCandidate, ...]
     top_default_count: int
     market_error: str | None = None
+    projection_error: str | None = None
 
     def agent_payload(self) -> dict[str, Any]:
         league_payload = self.league.agent_payload()
@@ -179,6 +194,7 @@ class WaiverContext:
             note
             for note in league_payload["limitations"]
             if not note.startswith("Available candidates are the highest current ECR")
+            and not note.startswith("Sleeper projections are not exposed")
         ]
         receptions = float(self.league.scoring_settings.get("rec", 0))
         scoring_format = (
@@ -186,6 +202,40 @@ class WaiverContext:
             if receptions >= 0.75
             else ("half_ppr" if receptions >= 0.25 else "standard")
         )
+        top_available_by_position = {}
+        for position, count in (("QB", 2), ("RB", 2), ("WR", 2), ("TE", 2), ("K", 1)):
+            values = sorted(
+                (
+                    candidate
+                    for candidate in self.available_players
+                    if candidate.position == position
+                    and candidate.projected_points is not None
+                ),
+                key=lambda candidate: (
+                    -(candidate.projected_points or 0),
+                    candidate.display_name,
+                ),
+            )[:count]
+            top_available_by_position[position] = [
+                candidate.agent_view() for candidate in values
+            ]
+        current_defenses = [
+            candidate.agent_view()
+            for candidate in self.managed_players
+            if candidate.position == "DEF"
+        ]
+        available_defenses = sorted(
+            (
+                candidate
+                for candidate in self.available_players
+                if candidate.position == "DEF"
+                and candidate.projected_points is not None
+            ),
+            key=lambda candidate: (
+                -(candidate.projected_points or 0),
+                candidate.display_name,
+            ),
+        )[:3]
         return {
             "league": {
                 "league_id": self.league.league_id,
@@ -217,6 +267,19 @@ class WaiverContext:
             "managed_roster_market": [
                 candidate.agent_view() for candidate in self.managed_players
             ],
+            "weekly_projections": {
+                "week": self.league.current_week,
+                "source": "Sleeper projection feed",
+                "scoring": "calculated from projected stats using this league's Sleeper scoring settings",
+                "error": self.projection_error,
+                "top_available_by_position": top_available_by_position,
+                "defense_streaming": {
+                    "current": current_defenses,
+                    "top_available": [
+                        candidate.agent_view() for candidate in available_defenses
+                    ],
+                },
+            },
             "market": {
                 "source": "FantasyCalc",
                 "scope": "current redraft values configured to league size, QB format, and PPR scoring",
@@ -230,5 +293,6 @@ class WaiverContext:
                 *limitations,
                 "The default packet exposes only top market candidates; use the waiver discovery tools for filtered or named searches.",
                 "FantasyCalc is a market signal, not a projection or real-time news source.",
+                "Sleeper weekly projections are estimates rather than guaranteed outcomes.",
             ],
         }

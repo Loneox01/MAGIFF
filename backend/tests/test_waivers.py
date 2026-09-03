@@ -1,10 +1,15 @@
 import json
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
 
 from integrations.fantasycalc import FantasyCalcClient, FantasyCalcValue
+from integrations.sleeper_projections import (
+    SleeperProjectionClient,
+    SleeperWeeklyProjection,
+)
 from league_management.models import (
     AvailableCandidate,
     LeagueContext,
@@ -53,6 +58,8 @@ def _candidate(
     value: int,
     trend: int,
     ecr: float | None,
+    projected_points: float | None = None,
+    opponent: str | None = None,
 ) -> WaiverCandidate:
     return WaiverCandidate(
         sleeper_player_id=sleeper_id,
@@ -69,6 +76,12 @@ def _candidate(
         trade_frequency=0.01,
         ecr=ecr,
         ecr_position_rank=1 if ecr is not None else None,
+        projection_week=1 if projected_points is not None else None,
+        projected_points=projected_points,
+        projection_opponent=opponent,
+        projection_game_date="2026-09-13" if projected_points is not None else None,
+        projection_updated_at=1 if projected_points is not None else None,
+        projection_source="rotowire" if projected_points is not None else None,
     )
 
 
@@ -146,12 +159,20 @@ def _waiver_context() -> WaiverContext:
     return WaiverContext(
         league=league,
         available_players=(
-            _candidate("add", "Available Player", "RB", "BUF", 5000, 400, 80),
-            _candidate("stash", "Deep Stash", "WR", "BUF", 3000, 800, 130),
-            _candidate("other", "Other Player", "TE", "NYJ", 3500, 20, None),
+            _candidate(
+                "add", "Available Player", "RB", "BUF", 5000, 400, 80, 15.5, "MIA"
+            ),
+            _candidate(
+                "stash", "Deep Stash", "WR", "BUF", 3000, 800, 130, 10.0, "MIA"
+            ),
+            _candidate(
+                "other", "Other Player", "TE", "NYJ", 3500, 20, None, 7.5, "NE"
+            ),
         ),
         managed_players=(
-            _candidate("bench", "Bench Player", "WR", "CHI", 2500, -50, 140),
+            _candidate(
+                "bench", "Bench Player", "WR", "CHI", 2500, -50, 140, 8.0, "GB"
+            ),
         ),
         top_default_count=2,
     )
@@ -263,6 +284,53 @@ class FakeFantasyCalc:
             ),
         ]
 
+
+def _projection(
+    sleeper_id: str,
+    name: str,
+    position: str,
+    team: str,
+    opponent: str,
+    week: int,
+    points: float,
+) -> SleeperWeeklyProjection:
+    return SleeperWeeklyProjection(
+        sleeper_player_id=sleeper_id,
+        display_name=name,
+        position=position,
+        team=team,
+        opponent=opponent,
+        season=2026,
+        week=week,
+        season_type="regular",
+        game_date=f"2026-09-{12 + week:02d}",
+        game_id=f"game-{week}-{sleeper_id}",
+        updated_at=1000 + week,
+        company="rotowire",
+        stats={"custom_projection": points, "pts_ppr": points},
+    )
+
+
+class FakeProjections:
+    def __init__(self, by_week=None):
+        self.by_week = by_week or {
+            1: [
+                _projection(
+                    "add", "Available Player", "RB", "BUF", "MIA", 1, 15.5
+                )
+            ]
+        }
+        self.calls = []
+
+    def weekly_projections(self, **kwargs):
+        self.calls.append(kwargs)
+        positions = set(kwargs.get("positions") or [])
+        return [
+            item
+            for item in self.by_week.get(kwargs["week"], [])
+            if not positions or item.position in positions
+        ]
+
 class FantasyCalcClientTests(unittest.TestCase):
     def test_normalizes_live_payload_shape(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -297,6 +365,65 @@ class FantasyCalcClientTests(unittest.TestCase):
         self.assertEqual(values[0].trend_30_day, 200)
 
 
+class SleeperProjectionClientTests(unittest.TestCase):
+    def test_normalizes_projection_and_uses_league_scoring(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.params["season_type"], "regular")
+            self.assertEqual(request.url.params.get_list("position[]"), ["RB"])
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "season": "2026",
+                        "week": 1,
+                        "season_type": "regular",
+                        "date": "2026-09-13",
+                        "player_id": "add",
+                        "team": "BUF",
+                        "opponent": "MIA",
+                        "updated_at": 1234,
+                        "company": "rotowire",
+                        "player": {
+                            "first_name": "Available",
+                            "last_name": "Player",
+                            "position": "RB",
+                            "fantasy_positions": ["RB"],
+                            "injury_status": "Questionable",
+                            "injury_body_part": "Hamstring",
+                            "injury_notes": "Limited",
+                            "injury_start_date": "2026-08-30",
+                            "news_updated": 1235,
+                        },
+                        "stats": {
+                            "rush_yd": 100,
+                            "rush_td": 1,
+                            "rec": 2,
+                            "pts_ppr": 20,
+                        },
+                    }
+                ],
+            )
+
+        rows = SleeperProjectionClient(
+            client=httpx.Client(transport=httpx.MockTransport(handler))
+        ).weekly_projections(
+            season=2026,
+            week=1,
+            positions=("RB",),
+        )
+
+        self.assertEqual(rows[0].display_name, "Available Player")
+        self.assertEqual(rows[0].injury_status, "Questionable")
+        self.assertEqual(rows[0].injury_body_part, "Hamstring")
+        self.assertEqual(rows[0].news_updated_at, 1235)
+        self.assertEqual(
+            rows[0].projected_points(
+                {"rush_yd": 0.1, "rush_td": 6, "rec": 1}
+            ),
+            18.0,
+        )
+
+
 class WaiverToolboxTests(unittest.TestCase):
     def test_context_builder_filters_rostered_market_values(self):
         league = _waiver_context().league
@@ -304,6 +431,7 @@ class WaiverToolboxTests(unittest.TestCase):
             league_builder=FakeLeagueBuilder(league),
             players=FakeIdentityRepository(),
             fantasycalc=FakeFantasyCalc(),
+            projections=FakeProjections(),
         )
 
         context = builder.build(
@@ -320,6 +448,7 @@ class WaiverToolboxTests(unittest.TestCase):
             [item.display_name for item in context.managed_players],
             ["Starting Player", "Bench Player"],
         )
+        self.assertEqual(context.available_players[0].projected_points, 15.5)
 
     def test_filters_market_pool_without_exposing_every_player(self):
         toolbox = WaiverToolbox(
@@ -343,6 +472,18 @@ class WaiverToolboxTests(unittest.TestCase):
             "available",
         )
 
+        projected = toolbox.rank_available_players(
+            position=None,
+            team=None,
+            sort_by="sleeper_projection",
+            limit=2,
+        )
+        self.assertEqual(projected["players"][0]["name"], "Available Player")
+        self.assertEqual(
+            projected["players"][0]["weekly_projection"]["points"],
+            15.5,
+        )
+
     def test_named_search_can_reach_available_player_outside_market_pool(self):
         deep_profile = {
             "player_id": "internal-deeper",
@@ -364,6 +505,151 @@ class WaiverToolboxTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "available")
         self.assertIsNone(result["player"]["fantasycalc"]["value"])
+
+    def test_streaming_defenses_excludes_rostered_teams_and_compares_current(self):
+        base = _waiver_context()
+        managed_defense = LeaguePlayer(
+            sleeper_player_id="JAX",
+            player_id=None,
+            display_name="Jacksonville Jaguars D/ST",
+            position="DEF",
+            team="JAX",
+            roster_status="ACT",
+        )
+        other_defense = LeaguePlayer(
+            sleeper_player_id="SEA",
+            player_id=None,
+            display_name="Seattle Seahawks D/ST",
+            position="DEF",
+            team="SEA",
+            roster_status="ACT",
+        )
+        managed_roster = replace(
+            base.league.managed_roster,
+            starters=(
+                *base.league.managed_roster.starters,
+                LineupAssignment(slot="DEF", player=managed_defense),
+            ),
+        )
+        other_roster = LeagueRoster(
+            roster_id=7,
+            owner_id="user-2",
+            owner_name="Opponent",
+            starters=(LineupAssignment(slot="DEF", player=other_defense),),
+            bench=(),
+            reserve=(),
+            taxi=(),
+            wins=0,
+            losses=0,
+            ties=0,
+            points_for=0,
+            waiver_position=3,
+            waiver_budget_used=0,
+        )
+        league = replace(
+            base.league,
+            managed_roster=managed_roster,
+            other_rosters=(other_roster,),
+        )
+        context = replace(
+            base,
+            league=league,
+            available_players=(
+                *base.available_players,
+                _candidate(
+                    "TEN",
+                    "Tennessee Titans D/ST",
+                    "DEF",
+                    "TEN",
+                    0,
+                    0,
+                    None,
+                    9.0,
+                    "NYJ",
+                ),
+            ),
+            managed_players=(
+                *base.managed_players,
+                _candidate(
+                    "JAX",
+                    "Jacksonville Jaguars D/ST",
+                    "DEF",
+                    "JAX",
+                    0,
+                    0,
+                    None,
+                    6.0,
+                    "CLE",
+                ),
+            ),
+        )
+        projections = FakeProjections(
+            {
+                2: [
+                    _projection(
+                        "JAX", "Jacksonville Jaguars D/ST", "DEF", "JAX", "KC", 2, 7.0
+                    ),
+                    _projection(
+                        "SEA", "Seattle Seahawks D/ST", "DEF", "SEA", "SF", 2, 10.0
+                    ),
+                    _projection(
+                        "TEN", "Tennessee Titans D/ST", "DEF", "TEN", "IND", 2, 8.0
+                    ),
+                ]
+            }
+        )
+        toolbox = WaiverToolbox(
+            context,
+            news=FakeNewsService(),
+            player_search=FakePlayerSearch(),
+            projections=projections,
+        )
+
+        result = toolbox.rank_streaming_defenses(
+            week=1,
+            lookahead_weeks=2,
+            limit=5,
+        )
+
+        self.assertEqual(result["available_defenses"][0]["team"], "TEN")
+        self.assertEqual(
+            result["available_defenses"][0]["current_week_advantage"],
+            3.0,
+        )
+        self.assertNotIn(
+            "SEA",
+            [item["team"] for item in result["available_defenses"]],
+        )
+        self.assertEqual(result["current_defenses"][0]["team"], "JAX")
+
+    def test_defense_news_verification_uses_team_scope(self):
+        context = replace(
+            _waiver_context(),
+            available_players=(
+                *_waiver_context().available_players,
+                _candidate(
+                    "TEN",
+                    "Tennessee Titans D/ST",
+                    "DEF",
+                    "TEN",
+                    0,
+                    0,
+                    None,
+                    9.0,
+                    "NYJ",
+                ),
+            ),
+        )
+        toolbox = WaiverToolbox(
+            context,
+            news=FakeNewsService(),
+            player_search=FakePlayerSearch(),
+        )
+
+        self.assertEqual(
+            toolbox.news_arguments_for("Tennessee Titans D/ST"),
+            {"player_ref": None, "team": "TEN", "limit": 3},
+        )
 
 
 class WaiverAgentTests(unittest.TestCase):

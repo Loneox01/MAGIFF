@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Protocol
 
 from integrations.fantasycalc import (
     FantasyCalcApiError,
     FantasyCalcClient,
     FantasyCalcValue,
+)
+from integrations.sleeper_projections import (
+    SleeperProjectionClient,
+    SleeperProjectionError,
+    SleeperWeeklyProjection,
 )
 from league_management.context import LeagueContextBuilder, LeaguePlayerRepository
 from repositories.league_supabase import SupabaseLeaguePlayerRepository
@@ -26,6 +32,17 @@ class FantasyCalcSource(Protocol):
         quarterback_slots: int,
         ppr: float,
     ) -> list[FantasyCalcValue]: ...
+
+
+class SleeperProjectionSource(Protocol):
+    def weekly_projections(
+        self,
+        *,
+        season: int,
+        week: int,
+        season_type: str,
+        positions: tuple[str, ...],
+    ) -> list[SleeperWeeklyProjection]: ...
 
 
 def _team(value: str | None) -> str | None:
@@ -52,6 +69,33 @@ def _quarterback_slots(roster_positions: tuple[str, ...]) -> int:
     )
 
 
+def _projection_season_type(value: str) -> str:
+    return "post" if value == "post" else "regular"
+
+
+def _projection_fields(
+    projection: SleeperWeeklyProjection | None,
+    scoring_settings: dict[str, float],
+) -> dict[str, object]:
+    if projection is None:
+        return {
+            "projection_week": None,
+            "projected_points": None,
+            "projection_opponent": None,
+            "projection_game_date": None,
+            "projection_updated_at": None,
+            "projection_source": None,
+        }
+    return {
+        "projection_week": projection.week,
+        "projected_points": projection.projected_points(scoring_settings),
+        "projection_opponent": _team(projection.opponent),
+        "projection_game_date": projection.game_date,
+        "projection_updated_at": projection.updated_at,
+        "projection_source": projection.company or "Sleeper",
+    }
+
+
 class WaiverContextBuilder:
     """Join live league availability, ECR, identities, and market values."""
 
@@ -61,12 +105,14 @@ class WaiverContextBuilder:
         league_builder: LeagueContextBuilder | None = None,
         players: LeaguePlayerRepository | None = None,
         fantasycalc: FantasyCalcSource | None = None,
+        projections: SleeperProjectionSource | None = None,
     ) -> None:
         self.players = players or SupabaseLeaguePlayerRepository()
         self.league_builder = league_builder or LeagueContextBuilder(
             players=self.players
         )
         self.fantasycalc = fantasycalc or FantasyCalcClient()
+        self.projections = projections or SleeperProjectionClient()
 
     def build(
         self,
@@ -91,15 +137,34 @@ class WaiverContextBuilder:
             ecr_as_of_date=ecr_as_of_date,
         )
         market_error = None
-        try:
-            values = self.fantasycalc.current_redraft_values(
+        projection_error = None
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            market_future = executor.submit(
+                self.fantasycalc.current_redraft_values,
                 teams=league.total_rosters,
                 quarterback_slots=_quarterback_slots(league.roster_positions),
                 ppr=_ppr_value(league.scoring_settings),
             )
-        except FantasyCalcApiError as error:
-            values = []
-            market_error = str(error)
+            projection_future = executor.submit(
+                self.projections.weekly_projections,
+                season=league.season,
+                week=league.current_week,
+                season_type=_projection_season_type(league.season_type),
+                positions=("QB", "RB", "WR", "TE", "K", "DEF"),
+            )
+            try:
+                values = market_future.result()
+            except FantasyCalcApiError as error:
+                values = []
+                market_error = str(error)
+            try:
+                weekly_projections = projection_future.result()
+            except SleeperProjectionError as error:
+                weekly_projections = []
+                projection_error = str(error)
+        projection_by_sleeper = {
+            item.sleeper_player_id: item for item in weekly_projections
+        }
         sleeper_ids = [
             item.sleeper_player_id
             for item in values
@@ -126,6 +191,7 @@ class WaiverContextBuilder:
                 continue
             profile = profiles.get(sleeper_id, {})
             ecr = ecr_by_sleeper.get(sleeper_id)
+            projection = projection_by_sleeper.get(sleeper_id)
             candidates.append(
                 WaiverCandidate(
                     sleeper_player_id=sleeper_id,
@@ -146,6 +212,7 @@ class WaiverContextBuilder:
                     trade_frequency=item.trade_frequency,
                     ecr=ecr.overall_rank if ecr else None,
                     ecr_position_rank=ecr.position_rank if ecr else None,
+                    **_projection_fields(projection, league.scoring_settings),
                 )
             )
 
@@ -154,6 +221,7 @@ class WaiverContextBuilder:
             for ecr in league.available_candidates:
                 if ecr.sleeper_player_id in known_ids:
                     continue
+                projection = projection_by_sleeper.get(ecr.sleeper_player_id)
                 candidates.append(
                     WaiverCandidate(
                         sleeper_player_id=ecr.sleeper_player_id,
@@ -170,12 +238,14 @@ class WaiverContextBuilder:
                         trade_frequency=None,
                         ecr=ecr.overall_rank,
                         ecr_position_rank=ecr.position_rank,
+                        **_projection_fields(projection, league.scoring_settings),
                     )
                 )
                 known_ids.add(ecr.sleeper_player_id)
         for player in league.managed_roster.all_players:
             if player.sleeper_player_id in known_ids:
                 continue
+            projection = projection_by_sleeper.get(player.sleeper_player_id)
             candidates.append(
                 WaiverCandidate(
                     sleeper_player_id=player.sleeper_player_id,
@@ -192,9 +262,40 @@ class WaiverContextBuilder:
                     trade_frequency=None,
                     ecr=None,
                     ecr_position_rank=None,
+                    **_projection_fields(projection, league.scoring_settings),
                 )
             )
             known_ids.add(player.sleeper_player_id)
+
+        # FantasyCalc intentionally omits positions such as team defense and
+        # may omit low-market players. Preserve every projected, unrostered
+        # Sleeper entity behind bounded waiver tools without serializing the
+        # entire set into the model's default context.
+        for projection in weekly_projections:
+            sleeper_id = projection.sleeper_player_id
+            if sleeper_id in known_ids:
+                continue
+            ecr = ecr_by_sleeper.get(sleeper_id)
+            candidates.append(
+                WaiverCandidate(
+                    sleeper_player_id=sleeper_id,
+                    player_id=None,
+                    display_name=projection.display_name,
+                    position=projection.position,
+                    team=_team(projection.team),
+                    roster_status=None,
+                    fantasycalc_value=None,
+                    fantasycalc_overall_rank=None,
+                    fantasycalc_position_rank=None,
+                    fantasycalc_trend_30_day=None,
+                    roster_percent=None,
+                    trade_frequency=None,
+                    ecr=ecr.overall_rank if ecr else None,
+                    ecr_position_rank=ecr.position_rank if ecr else None,
+                    **_projection_fields(projection, league.scoring_settings),
+                )
+            )
+            known_ids.add(sleeper_id)
 
         available = tuple(
             sorted(
@@ -233,4 +334,5 @@ class WaiverContextBuilder:
             managed_players=managed,
             top_default_count=top_default_count,
             market_error=market_error,
+            projection_error=projection_error,
         )

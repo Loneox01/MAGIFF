@@ -33,3 +33,8 @@ The policy-specific read-only waiver workflow lives separately under
 `waivers/`. It consumes this league snapshot but keeps the broader free-agent
 and FantasyCalc pools behind bounded tools instead of serializing them into the
 default model prompt.
+
+The policy-specific read-only lineup workflow lives under `lineups/`. It skips
+the unrelated ECR market query, joins the managed roster to Sleeper's
+best-effort weekly projection and injury payload, and validates every proposed
+starter against roster membership and legal slot eligibility.

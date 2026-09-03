@@ -304,7 +304,7 @@ class WaiverAgentService:
     ) -> dict[str, Any]:
         evidence: dict[str, Any] = {}
         for name in self._verification_names(preliminary):
-            arguments = {"player_ref": name, "team": None, "limit": 3}
+            arguments = toolbox.news_arguments_for(name, limit=3)
             try:
                 output = toolbox.get_recent_news(**arguments)
                 succeeded = output.get("status") not in {
